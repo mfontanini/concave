@@ -7,6 +7,7 @@ use async_stream::try_stream;
 use futures::{Stream, StreamExt};
 use log::{error, info, warn};
 use prost::Message;
+use std::collections::HashMap;
 use std::io;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -88,12 +89,21 @@ impl Storage {
         Ok(())
     }
 
-    /// Reads objects from a reader.
-    pub async fn read_objects<R: AsyncRead + Unpin>(reader: R) -> Result<Vec<Object>, ReadError> {
-        let mut objects = Vec::new();
-        let mut stream = Box::pin(iter_objects(reader));
-        while let Some(object) = stream.next().await {
-            objects.push(object?);
+    /// Reads all objects in a list of blocks. Blocks are assumed to be in order, meaning if key X
+    /// shows up in block N and N+1, then its version in N+1 is assumed to be greater than the one in N.
+    pub async fn read_blocks<B: BlockIO>(
+        block_io: &B,
+        blocks: &[Block],
+    ) -> Result<HashMap<String, Object>, ReadError> {
+        let mut objects = HashMap::new();
+        for block in blocks {
+            info!("Processing block {}", block.id);
+            let reader = block_io.block_reader(block).await?;
+            let mut stream = Box::pin(iter_objects(reader));
+            while let Some(object) = stream.next().await {
+                let object = object?;
+                objects.insert(object.key.clone(), object);
+            }
         }
         Ok(objects)
     }
@@ -103,6 +113,15 @@ impl Storage {
 pub enum StorageCreateError {
     #[error("failed to find blocks: {0}")]
     FindBlocks(#[from] FindBlocksError),
+}
+
+#[derive(Error, Debug)]
+pub enum ReadError {
+    #[error(transparent)]
+    Io(#[from] io::Error),
+
+    #[error("malformed stream")]
+    MalformedStream(#[from] prost::DecodeError),
 }
 
 #[derive(Debug, Error)]
@@ -261,15 +280,6 @@ fn iter_objects<R: AsyncRead + Unpin>(reader: R) -> impl Stream<Item = Result<Ob
             };
         }
     }
-}
-
-#[derive(Error, Debug)]
-pub enum ReadError {
-    #[error(transparent)]
-    Io(#[from] io::Error),
-
-    #[error("malformed stream")]
-    MalformedStream(#[from] prost::DecodeError),
 }
 
 #[derive(Error, Debug)]

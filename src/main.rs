@@ -62,19 +62,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let block_io = FilesystemBlockIO::new(storage_path);
 
     // Read any existing objects from the storage
-    info!("Loading existing objects...");
-    let mut existing_objects = HashMap::new();
-    for block in block_io.find_blocks().await? {
-        info!("Processing block {}", block.id);
-        let reader = block_io.block_reader(&block).await?;
-        for object in Storage::read_objects(reader).await? {
-            existing_objects.insert(object.key.clone(), object);
+    let existing_blocks = block_io.find_blocks().await?;
+    let existing_objects;
+    if !existing_blocks.is_empty() {
+        info!(
+            "Found {} existing blocks, loading objects...",
+            existing_blocks.len()
+        );
+        existing_objects = Storage::read_blocks(&block_io, &existing_blocks).await?;
+        match existing_objects.len() {
+            0 => info!("Found no existing objects"),
+            count => info!("Found {count} existing objects"),
         }
+    } else {
+        info!("Found no existing blocks");
+        existing_objects = HashMap::new();
     }
-    match existing_objects.len() {
-        0 => info!("Found no existing objects"),
-        count => info!("Found {count} existing objects"),
-    };
     let storage = Storage::new(block_io, storage_config).await?;
     let engine = KeyValueEngine::from_existing(existing_objects);
     let service = web::Data::new(KeyValueService::new(engine, storage));
