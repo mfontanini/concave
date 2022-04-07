@@ -271,13 +271,13 @@ mod tests {
     use crate::{io::NullBlockIO, storage::StorageConfig};
     use std::time::Duration;
 
-    fn make_storage() -> Storage {
+    async fn make_storage() -> Storage {
         let config = StorageConfig {
             batch_time: Duration::from_millis(1),
             max_batch_size: 10,
             max_block_size: 10,
         };
-        Storage::new(NullBlockIO::default(), config)
+        Storage::new(NullBlockIO::default(), config).await.unwrap()
     }
 
     #[tokio::test]
@@ -354,7 +354,7 @@ mod tests {
 
     #[tokio::test]
     async fn service_put_and_get() {
-        let service = KeyValueService::new(KeyValueEngine::default(), make_storage());
+        let service = KeyValueService::new(KeyValueEngine::default(), make_storage().await);
         // Not here yet
         assert_eq!(service.get("hello").await, None);
         // Wrong version

@@ -1,6 +1,6 @@
 use crate::{
-    block::OpenBlock,
-    io::{BlockCloseError, BlockIO, BlockOpenError},
+    block::{Block, OpenBlock},
+    io::{BlockCloseError, BlockIO, BlockOpenError, FindBlocksError},
     Object,
 };
 use async_stream::try_stream;
@@ -70,9 +70,12 @@ pub struct Storage {
 }
 
 impl Storage {
-    pub fn new<B: BlockIO + Send + Sync + 'static>(block_io: B, config: StorageConfig) -> Self {
-        let writer_context = StorageWriter::new(block_io, config).launch();
-        Self { writer_context }
+    pub async fn new<B: BlockIO + Send + Sync + 'static>(
+        block_io: B,
+        config: StorageConfig,
+    ) -> Result<Self, StorageCreateError> {
+        let writer_context = StorageWriter::new(block_io, config).await?.launch();
+        Ok(Self { writer_context })
     }
 
     /// Schedule a write. The oneshot channel in the write request will be fulfilled when the
@@ -97,6 +100,12 @@ impl Storage {
 }
 
 #[derive(Debug, Error)]
+pub enum StorageCreateError {
+    #[error("failed to find blocks: {0}")]
+    FindBlocks(#[from] FindBlocksError),
+}
+
+#[derive(Debug, Error)]
 pub enum WriteError {
     #[error("failed to schedule write")]
     ScheduleFailure,
@@ -105,12 +114,21 @@ pub enum WriteError {
 /// This is the type doing the heavy work: this batches data, manages BlockIOs, etc.
 struct StorageWriter<B: BlockIO> {
     block_io: B,
+    closed_blocks: Vec<Block>,
+    next_block_id: u64,
     config: StorageConfig,
 }
 
 impl<B: BlockIO + Send + Sync + 'static> StorageWriter<B> {
-    pub fn new(block_io: B, config: StorageConfig) -> Self {
-        Self { block_io, config }
+    pub async fn new(block_io: B, config: StorageConfig) -> Result<Self, StorageCreateError> {
+        let closed_blocks = block_io.find_blocks().await?;
+        let next_block_id = closed_blocks.last().map(|block| block.id).unwrap_or(0);
+        Ok(Self {
+            block_io,
+            closed_blocks,
+            next_block_id,
+            config,
+        })
     }
 
     /// Launches the writer. The sender in the returned context can be used to schedule write requests.
@@ -134,7 +152,7 @@ impl<B: BlockIO + Send + Sync + 'static> StorageWriter<B> {
         mut receiver: Receiver<WriteRequest>,
         running: Arc<AtomicBool>,
     ) -> Result<(), WriteLoopError> {
-        let mut open_block = self.block_io.open_block().await?;
+        let mut open_block = self.open_block().await?;
         while running.load(Ordering::Acquire) {
             let batch = self.build_batch(&mut receiver).await?;
             open_block = self.write_batch(open_block, &batch).await?;
@@ -192,10 +210,26 @@ impl<B: BlockIO + Send + Sync + 'static> StorageWriter<B> {
     ) -> Result<OpenBlock<B::Writer>, WriteLoopError> {
         open_block.write(&batch.data).await?;
         if open_block.size() >= self.config.max_block_size {
-            self.block_io.close_block(open_block).await?;
-            open_block = self.block_io.open_block().await?;
+            self.close_block(open_block).await?;
+            open_block = self.open_block().await?;
         }
         Ok(open_block)
+    }
+
+    async fn open_block(&mut self) -> Result<OpenBlock<B::Writer>, BlockOpenError> {
+        let block = self.block_io.open_block(self.next_block_id).await?;
+        self.next_block_id += 1;
+        Ok(block)
+    }
+
+    async fn close_block(
+        &mut self,
+        open_block: OpenBlock<B::Writer>,
+    ) -> Result<(), BlockCloseError> {
+        let block = open_block.block().clone();
+        self.block_io.close_block(open_block).await?;
+        self.closed_blocks.push(block);
+        Ok(())
     }
 
     async fn notify_all(notifiers: Vec<oneshot::Sender<WriteResult>>, result: WriteResult) {
@@ -319,35 +353,38 @@ mod tests {
         }
     }
 
-    fn make_writer(
+    async fn make_writer(
         max_batch_size: usize,
         batch_time: Duration,
     ) -> (StorageWriter<NullBlockIO>, Arc<Mutex<Vec<Vec<u8>>>>) {
         let block_io = NullBlockIO::default();
         let blocks = block_io.blocks_data();
         (
-            StorageWriter::new(block_io, make_config(max_batch_size, batch_time)),
+            StorageWriter::new(block_io, make_config(max_batch_size, batch_time))
+                .await
+                .unwrap(),
             blocks,
         )
     }
 
-    fn make_instant_writer() -> (StorageWriter<NullBlockIO>, Arc<Mutex<Vec<Vec<u8>>>>) {
-        make_writer(1, Duration::from_millis(10))
+    async fn make_instant_writer() -> (StorageWriter<NullBlockIO>, Arc<Mutex<Vec<Vec<u8>>>>) {
+        make_writer(1, Duration::from_millis(10)).await
     }
-    fn make_buffered_writer() -> (StorageWriter<NullBlockIO>, Arc<Mutex<Vec<Vec<u8>>>>) {
-        make_writer(100, Duration::from_millis(100))
+
+    async fn make_buffered_writer() -> (StorageWriter<NullBlockIO>, Arc<Mutex<Vec<Vec<u8>>>>) {
+        make_writer(100, Duration::from_millis(100)).await
     }
 
     #[tokio::test]
     async fn launch_write_loop() {
-        let writer = make_instant_writer();
+        let writer = make_instant_writer().await;
         // Simply launch and join to make sure we don't get stuck
         writer.0.launch();
     }
 
     #[tokio::test]
     async fn write_batch() {
-        let (writer, blocks) = make_buffered_writer();
+        let (writer, blocks) = make_buffered_writer().await;
         let context = writer.launch();
         let batch_objects = vec![
             Object::new("my key", "and its value"),

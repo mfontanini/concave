@@ -14,37 +14,61 @@ use tokio::{
 pub trait BlockIO {
     type Writer: AsyncWrite + Unpin + Send;
 
-    async fn open_block(&mut self) -> Result<OpenBlock<Self::Writer>, BlockOpenError>;
+    async fn open_block(&mut self, id: u64) -> Result<OpenBlock<Self::Writer>, BlockOpenError>;
     async fn close_block(
         &mut self,
         open_block: OpenBlock<Self::Writer>,
     ) -> Result<(), BlockCloseError>;
     async fn block_reader(&self, block: &Block) -> io::Result<Box<dyn AsyncRead + Unpin>>;
-    fn existing_blocks(&self) -> Vec<Block>;
+    async fn find_blocks(&self) -> Result<Vec<Block>, FindBlocksError>;
 }
 
-#[derive(PartialEq, Debug, Clone)]
-enum BlockWritingState {
-    Open { id: u64 },
-    Closed,
-}
-
-/// A durable implementation of BlockIO that uses file blocks to persist data.
-///
-/// Upon creation, the storage directory is scanned to find existing blocks. The last existing block
-/// will be open in append more and written to.
+/// A durable implementation of BlockIO that uses file blocks to persist data..
 pub struct FilesystemBlockIO {
     base_path: PathBuf,
-    blocks: Vec<Block>,
-    next_block_id: u64,
-    state: BlockWritingState,
 }
 
 impl FilesystemBlockIO {
-    pub async fn new<P: Into<PathBuf>>(base_path: P) -> Result<Self, StorageCreateError> {
-        let base_path: PathBuf = base_path.into();
+    pub fn new<P: Into<PathBuf>>(base_path: P) -> Self {
+        Self {
+            base_path: base_path.into(),
+        }
+    }
+}
+
+#[async_trait]
+impl BlockIO for FilesystemBlockIO {
+    type Writer = File;
+
+    async fn open_block(&mut self, id: u64) -> Result<OpenBlock<Self::Writer>, BlockOpenError> {
+        let block_path = self.base_path.join(BlockPath { id }.to_string());
+        let block = Block { id };
+        let file = OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(&block_path)
+            .await?;
+        let metadata = file.metadata().await?;
+
+        Ok(OpenBlock::new(block, file, metadata.len() as usize))
+    }
+
+    async fn close_block(
+        &mut self,
+        _open_block: OpenBlock<Self::Writer>,
+    ) -> Result<(), BlockCloseError> {
+        Ok(())
+    }
+
+    async fn block_reader(&self, block: &Block) -> io::Result<Box<dyn AsyncRead + Unpin>> {
+        let path = self.base_path.join(block.path().to_string());
+        let file = File::open(path).await?;
+        Ok(Box::new(file))
+    }
+
+    async fn find_blocks(&self) -> Result<Vec<Block>, FindBlocksError> {
         let mut blocks: Vec<Block> = Vec::new();
-        let mut dirs = fs::read_dir(&base_path).await?;
+        let mut dirs = fs::read_dir(&self.base_path).await?;
         while let Some(entry) = dirs.next_entry().await? {
             if entry.file_type().await?.is_file() {
                 let file_name = entry.file_name();
@@ -56,73 +80,12 @@ impl FilesystemBlockIO {
             }
         }
         blocks.sort_by(|left, right| left.id.cmp(&right.id));
-        let next_block_id = blocks.last().map(|block| block.id).unwrap_or(0);
-        Ok(Self {
-            base_path,
-            blocks,
-            next_block_id,
-            state: BlockWritingState::Closed,
-        })
-    }
-
-    pub fn blocks(&self) -> &[Block] {
-        &self.blocks
-    }
-}
-
-#[async_trait]
-impl BlockIO for FilesystemBlockIO {
-    type Writer = File;
-
-    async fn open_block(&mut self) -> Result<OpenBlock<Self::Writer>, BlockOpenError> {
-        if matches!(self.state, BlockWritingState::Open { .. }) {
-            return Err(BlockOpenError::BlockAlreadyOpen);
-        }
-        let block_id = self.next_block_id;
-        let block_path = self.base_path.join(BlockPath { id: block_id }.to_string());
-        let block = Block { id: block_id };
-        let file = OpenOptions::new()
-            .append(true)
-            .create(true)
-            .open(&block_path)
-            .await?;
-        let metadata = file.metadata().await?;
-
-        self.state = BlockWritingState::Open { id: block_id };
-        self.next_block_id += 1;
-        Ok(OpenBlock::new(block, file, metadata.len() as usize))
-    }
-
-    async fn close_block(
-        &mut self,
-        open_block: OpenBlock<Self::Writer>,
-    ) -> Result<(), BlockCloseError> {
-        let expected_state = BlockWritingState::Open {
-            id: open_block.block().id,
-        };
-        if self.state != expected_state {
-            return Err(BlockCloseError::NotOpenBlock);
-        }
-        self.state = BlockWritingState::Closed;
-        self.blocks.push(open_block.block().clone());
-        Ok(())
-    }
-
-    async fn block_reader(&self, block: &Block) -> io::Result<Box<dyn AsyncRead + Unpin>> {
-        let path = self.base_path.join(block.path().to_string());
-        let file = File::open(path).await?;
-        Ok(Box::new(file))
-    }
-
-    fn existing_blocks(&self) -> Vec<Block> {
-        self.blocks.clone()
+        Ok(blocks)
     }
 }
 
 /// An in memory version of BlockIO. This is used mostly for testing.
 pub struct NullBlockIO {
-    state: BlockWritingState,
-    next_block_id: u64,
     blocks: Arc<Mutex<Vec<Vec<u8>>>>,
 }
 
@@ -135,8 +98,6 @@ impl NullBlockIO {
 impl Default for NullBlockIO {
     fn default() -> Self {
         Self {
-            state: BlockWritingState::Closed,
-            next_block_id: 0,
             blocks: Arc::new(Mutex::new(Vec::new())),
         }
     }
@@ -146,15 +107,9 @@ impl Default for NullBlockIO {
 impl BlockIO for NullBlockIO {
     type Writer = io::Cursor<Vec<u8>>;
 
-    async fn open_block(&mut self) -> Result<OpenBlock<Self::Writer>, BlockOpenError> {
-        if matches!(self.state, BlockWritingState::Open { .. }) {
-            return Err(BlockOpenError::BlockAlreadyOpen);
-        }
-        let block_id = self.next_block_id;
+    async fn open_block(&mut self, id: u64) -> Result<OpenBlock<Self::Writer>, BlockOpenError> {
         let storage = io::Cursor::new(Vec::new());
-        let block = Block { id: block_id };
-        self.next_block_id += 1;
-        self.state = BlockWritingState::Open { id: block_id };
+        let block = Block { id };
         Ok(OpenBlock::new(block, storage, 0))
     }
 
@@ -162,13 +117,6 @@ impl BlockIO for NullBlockIO {
         &mut self,
         open_block: OpenBlock<Self::Writer>,
     ) -> Result<(), BlockCloseError> {
-        let expected_state = BlockWritingState::Open {
-            id: open_block.block().id,
-        };
-        if self.state != expected_state {
-            return Err(BlockCloseError::NotOpenBlock);
-        }
-        self.state = BlockWritingState::Closed;
         // Save this block for later
         let writer = open_block.into_writer();
         self.blocks.lock().unwrap().push(writer.into_inner());
@@ -181,16 +129,26 @@ impl BlockIO for NullBlockIO {
         Ok(Box::new(io::Cursor::new(block)))
     }
 
-    fn existing_blocks(&self) -> Vec<Block> {
+    async fn find_blocks(&self) -> Result<Vec<Block>, FindBlocksError> {
         let blocks = self.blocks.lock().unwrap();
-        (0..blocks.len())
+        let blocks = (0..blocks.len())
             .map(|id| Block { id: id as u64 })
-            .collect()
+            .collect();
+        Ok(blocks)
     }
 }
 
 #[derive(Error, Debug)]
 pub enum StorageCreateError {
+    #[error(transparent)]
+    Io(#[from] io::Error),
+
+    #[error(transparent)]
+    BlockNameParse(#[from] BlockNameParseError),
+}
+
+#[derive(Error, Debug)]
+pub enum FindBlocksError {
     #[error(transparent)]
     Io(#[from] io::Error),
 
@@ -223,33 +181,30 @@ mod tests {
     use tokio::io::AsyncReadExt;
 
     async fn test_block_opens<B: BlockIO>(mut block_io: B) {
-        let first_block = block_io.open_block().await.unwrap();
+        let first_block = block_io.open_block(0).await.unwrap();
         assert_eq!(first_block.block().id, 0);
         block_io.close_block(first_block).await.unwrap();
 
-        let second_block = block_io.open_block().await.unwrap();
+        let second_block = block_io.open_block(1).await.unwrap();
         assert_eq!(second_block.block().id, 1);
-
-        // Shouldn't be allowed to open while another block is open
-        assert!(block_io.open_block().await.is_err());
     }
 
     #[tokio::test]
     async fn open_block() {
         let dir = tempdir().unwrap();
-        let block_io = FilesystemBlockIO::new(dir.path()).await.unwrap();
+        let block_io = FilesystemBlockIO::new(dir.path());
         test_block_opens(block_io).await;
     }
 
     #[tokio::test]
     async fn write_and_read() {
         let dir = tempdir().unwrap();
-        let mut block_io = FilesystemBlockIO::new(dir.path()).await.unwrap();
-        let mut block = block_io.open_block().await.unwrap();
+        let mut block_io = FilesystemBlockIO::new(dir.path());
+        let mut block = block_io.open_block(0).await.unwrap();
         block.write(b"hello world").await.unwrap();
         block_io.close_block(block).await.unwrap();
 
-        let blocks = block_io.existing_blocks();
+        let blocks = block_io.find_blocks().await.unwrap();
         assert_eq!(blocks.len(), 1);
         let mut reader = block_io.block_reader(&blocks[0]).await.unwrap();
         let mut buffer = String::new();
@@ -267,12 +222,9 @@ mod tests {
             .await
             .unwrap();
 
-        let mut block_io = FilesystemBlockIO::new(dir.path()).await.unwrap();
-        assert_eq!(block_io.blocks(), &[Block { id: 0 }, Block { id: 1 }]);
-
-        // The first open block should be the last written one, as we assume it's partially completed
-        let first_block = block_io.open_block().await.unwrap();
-        assert_eq!(first_block.block().id, 1);
+        let block_io = FilesystemBlockIO::new(dir.path());
+        let blocks = block_io.find_blocks().await.unwrap();
+        assert_eq!(blocks, &[Block { id: 0 }, Block { id: 1 }]);
     }
 
     #[tokio::test]
