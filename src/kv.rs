@@ -1,5 +1,8 @@
-use crate::storage::{self, Storage, WriteRequest};
-use crate::Object;
+use crate::{
+    io::BlockIO,
+    storage::{self, Storage, WriteRequest},
+    Object,
+};
 use std::collections::HashMap;
 use thiserror::Error;
 use tokio::sync::oneshot;
@@ -190,17 +193,17 @@ pub enum CommitError {
     KeyDoesNotExist,
 }
 
-pub struct KeyValueService {
+pub struct KeyValueService<B: BlockIO + Send + Sync + 'static> {
     engine: KeyValueEngine,
-    storage: Storage,
+    storage: Storage<B>,
 }
 
 /// The key value service.
 ///
 /// This service interfaces directly with the key/value engine and the persistent storage
 /// and exposes a get/put API using their primitives.
-impl KeyValueService {
-    pub fn new(engine: KeyValueEngine, storage: Storage) -> Self {
+impl<B: BlockIO + Send + Sync + 'static> KeyValueService<B> {
+    pub fn new(engine: KeyValueEngine, storage: Storage<B>) -> Self {
         Self { engine, storage }
     }
 
@@ -269,15 +272,18 @@ pub enum PutError {
 mod tests {
     use super::*;
     use crate::{io::NullBlockIO, storage::StorageConfig};
+    use std::sync::Arc;
     use std::time::Duration;
 
-    async fn make_storage() -> Storage {
+    async fn make_storage() -> Storage<NullBlockIO> {
         let config = StorageConfig {
             batch_time: Duration::from_millis(1),
             max_batch_size: 10,
             max_block_size: 10,
         };
-        Storage::new(NullBlockIO::default(), config).await.unwrap()
+        Storage::new(Arc::new(NullBlockIO::default()), config)
+            .await
+            .unwrap()
     }
 
     #[tokio::test]

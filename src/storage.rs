@@ -66,17 +66,18 @@ pub struct StorageConfig {
 }
 
 /// This is the glue between writers and the underlying filesystem.
-pub struct Storage {
+pub struct Storage<B: BlockIO + Send + Sync + 'static> {
     writer_context: WriterContext,
+    block_io: Arc<B>,
 }
 
-impl Storage {
-    pub async fn new<B: BlockIO + Send + Sync + 'static>(
-        block_io: B,
-        config: StorageConfig,
-    ) -> Result<Self, StorageCreateError> {
-        let writer_context = StorageWriter::new(block_io, config).await?.launch();
-        Ok(Self { writer_context })
+impl<B: BlockIO + Send + Sync + 'static> Storage<B> {
+    pub async fn new(block_io: Arc<B>, config: StorageConfig) -> Result<Self, StorageCreateError> {
+        let writer_context = StorageWriter::new(block_io.clone(), config).await?.launch();
+        Ok(Self {
+            block_io,
+            writer_context,
+        })
     }
 
     /// Schedule a write. The oneshot channel in the write request will be fulfilled when the
@@ -91,14 +92,14 @@ impl Storage {
 
     /// Reads all objects in a list of blocks. Blocks are assumed to be in order, meaning if key X
     /// shows up in block N and N+1, then its version in N+1 is assumed to be greater than the one in N.
-    pub async fn read_blocks<B: BlockIO>(
-        block_io: &B,
+    pub async fn read_blocks(
+        &self,
         blocks: &[Block],
     ) -> Result<HashMap<String, Object>, ReadError> {
         let mut objects = HashMap::new();
         for block in blocks {
             info!("Processing block {}", block.id);
-            let reader = block_io.block_reader(block).await?;
+            let reader = self.block_io.block_reader(block).await?;
             let mut stream = Box::pin(iter_objects(reader));
             while let Some(object) = stream.next().await {
                 let object = object?;
@@ -106,6 +107,10 @@ impl Storage {
             }
         }
         Ok(objects)
+    }
+
+    pub fn block_io(&self) -> Arc<B> {
+        self.block_io.clone()
     }
 }
 
@@ -132,14 +137,14 @@ pub enum WriteError {
 
 /// This is the type doing the heavy work: this batches data, manages BlockIOs, etc.
 struct StorageWriter<B: BlockIO> {
-    block_io: B,
+    block_io: Arc<B>,
     closed_blocks: Vec<Block>,
     next_block_id: u64,
     config: StorageConfig,
 }
 
 impl<B: BlockIO + Send + Sync + 'static> StorageWriter<B> {
-    pub async fn new(block_io: B, config: StorageConfig) -> Result<Self, StorageCreateError> {
+    pub async fn new(block_io: Arc<B>, config: StorageConfig) -> Result<Self, StorageCreateError> {
         let closed_blocks = block_io.find_blocks().await?;
         let next_block_id = closed_blocks.last().map(|block| block.id).unwrap_or(0);
         Ok(Self {
@@ -344,8 +349,7 @@ impl From<Object> for proto::Object {
 mod tests {
     use super::*;
     use crate::io::NullBlockIO;
-    use futures::StreamExt;
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
 
     #[ctor::ctor]
     fn init() {
@@ -363,56 +367,64 @@ mod tests {
         }
     }
 
-    async fn make_writer(
-        max_batch_size: usize,
-        batch_time: Duration,
-    ) -> (StorageWriter<NullBlockIO>, Arc<Mutex<Vec<Vec<u8>>>>) {
-        let block_io = NullBlockIO::default();
-        let blocks = block_io.blocks_data();
-        (
-            StorageWriter::new(block_io, make_config(max_batch_size, batch_time))
-                .await
-                .unwrap(),
-            blocks,
-        )
+    async fn make_storage(max_batch_size: usize, batch_time: Duration) -> Storage<NullBlockIO> {
+        let block_io = Arc::new(NullBlockIO::default());
+        Storage::new(block_io, make_config(max_batch_size, batch_time))
+            .await
+            .unwrap()
     }
 
-    async fn make_instant_writer() -> (StorageWriter<NullBlockIO>, Arc<Mutex<Vec<Vec<u8>>>>) {
-        make_writer(1, Duration::from_millis(10)).await
+    async fn make_instant_storage() -> Storage<NullBlockIO> {
+        // A storage that will immediately dump a batch request
+        make_storage(1, Duration::from_millis(0)).await
     }
 
-    async fn make_buffered_writer() -> (StorageWriter<NullBlockIO>, Arc<Mutex<Vec<Vec<u8>>>>) {
-        make_writer(100, Duration::from_millis(100)).await
+    async fn make_buffered_storage() -> Storage<NullBlockIO> {
+        // A storage that will attempt to buffer writes a bit
+        make_storage(100, Duration::from_millis(100)).await
     }
 
     #[tokio::test]
     async fn launch_write_loop() {
-        let writer = make_instant_writer().await;
-        // Simply launch and join to make sure we don't get stuck
-        writer.0.launch();
+        // Simply create it and implicitly join to make sure we don't get stuck
+        let _storage = make_instant_storage().await;
     }
 
     #[tokio::test]
     async fn write_batch() {
-        let (writer, blocks) = make_buffered_writer().await;
-        let context = writer.launch();
+        let storage = make_buffered_storage().await;
         let batch_objects = vec![
             Object::new("my key", "and its value"),
             Object::new("another key", "another value"),
         ];
         let (notifier, receiver) = oneshot::channel();
         let batch = WriteRequest::new(batch_objects.clone(), notifier);
-        let sender = &context.request_sender;
-        sender.send(batch).await.unwrap();
+        storage.write(batch).await.unwrap();
         assert!(receiver.await.unwrap().success);
 
-        let blocks = blocks.lock().unwrap();
+        let blocks = storage.block_io().find_blocks().await.unwrap();
         assert_eq!(blocks.len(), 1);
 
-        let objects: Vec<_> = iter_objects(io::Cursor::new(&blocks[0]))
-            .map(Result::unwrap)
-            .collect()
-            .await;
-        assert_eq!(objects, batch_objects);
+        let objects = storage.read_blocks(&blocks).await.unwrap();
+        assert_eq!(objects.len(), 2);
+        assert_eq!(objects.get("my key"), Some(&batch_objects[0]));
+        assert_eq!(objects.get("another key"), Some(&batch_objects[1]));
+    }
+
+    #[tokio::test]
+    async fn multiple_blocks() {
+        let storage = make_instant_storage().await;
+        for key in ["a", "b"] {
+            let (notifier, receiver) = oneshot::channel();
+            let batch = WriteRequest::new(vec![Object::new(key, "and its value")], notifier);
+            storage.write(batch).await.unwrap();
+            assert!(receiver.await.unwrap().success);
+        }
+
+        let blocks = storage.block_io().find_blocks().await.unwrap();
+        assert_eq!(blocks.len(), 2);
+
+        let objects = storage.read_blocks(&blocks).await.unwrap();
+        assert_eq!(objects.len(), 2);
     }
 }

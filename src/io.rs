@@ -14,11 +14,9 @@ use tokio::{
 pub trait BlockIO {
     type Writer: AsyncWrite + Unpin + Send;
 
-    async fn open_block(&mut self, id: u64) -> Result<OpenBlock<Self::Writer>, BlockOpenError>;
-    async fn close_block(
-        &mut self,
-        open_block: OpenBlock<Self::Writer>,
-    ) -> Result<(), BlockCloseError>;
+    async fn open_block(&self, id: u64) -> Result<OpenBlock<Self::Writer>, BlockOpenError>;
+    async fn close_block(&self, open_block: OpenBlock<Self::Writer>)
+        -> Result<(), BlockCloseError>;
     async fn block_reader(&self, block: &Block) -> io::Result<Box<dyn AsyncRead + Unpin>>;
     async fn find_blocks(&self) -> Result<Vec<Block>, FindBlocksError>;
 }
@@ -40,7 +38,7 @@ impl FilesystemBlockIO {
 impl BlockIO for FilesystemBlockIO {
     type Writer = File;
 
-    async fn open_block(&mut self, id: u64) -> Result<OpenBlock<Self::Writer>, BlockOpenError> {
+    async fn open_block(&self, id: u64) -> Result<OpenBlock<Self::Writer>, BlockOpenError> {
         let block_path = self.base_path.join(BlockPath { id }.to_string());
         let block = Block { id };
         let file = OpenOptions::new()
@@ -54,7 +52,7 @@ impl BlockIO for FilesystemBlockIO {
     }
 
     async fn close_block(
-        &mut self,
+        &self,
         _open_block: OpenBlock<Self::Writer>,
     ) -> Result<(), BlockCloseError> {
         Ok(())
@@ -107,14 +105,14 @@ impl Default for NullBlockIO {
 impl BlockIO for NullBlockIO {
     type Writer = io::Cursor<Vec<u8>>;
 
-    async fn open_block(&mut self, id: u64) -> Result<OpenBlock<Self::Writer>, BlockOpenError> {
+    async fn open_block(&self, id: u64) -> Result<OpenBlock<Self::Writer>, BlockOpenError> {
         let storage = io::Cursor::new(Vec::new());
         let block = Block { id };
         Ok(OpenBlock::new(block, storage, 0))
     }
 
     async fn close_block(
-        &mut self,
+        &self,
         open_block: OpenBlock<Self::Writer>,
     ) -> Result<(), BlockCloseError> {
         // Save this block for later
@@ -180,7 +178,7 @@ mod tests {
     use tempfile::tempdir;
     use tokio::io::AsyncReadExt;
 
-    async fn test_block_opens<B: BlockIO>(mut block_io: B) {
+    async fn test_block_opens<B: BlockIO>(block_io: B) {
         let first_block = block_io.open_block(0).await.unwrap();
         assert_eq!(first_block.block().id, 0);
         block_io.close_block(first_block).await.unwrap();
@@ -199,7 +197,7 @@ mod tests {
     #[tokio::test]
     async fn write_and_read() {
         let dir = tempdir().unwrap();
-        let mut block_io = FilesystemBlockIO::new(dir.path());
+        let block_io = FilesystemBlockIO::new(dir.path());
         let mut block = block_io.open_block(0).await.unwrap();
         block.write(b"hello world").await.unwrap();
         block_io.close_block(block).await.unwrap();

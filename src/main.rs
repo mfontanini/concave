@@ -8,6 +8,7 @@ use concave::{
 use log::info;
 use serde_derive::Serialize;
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::fs::create_dir_all;
 
@@ -22,7 +23,7 @@ enum PutResponse {
 #[get("/v1/get/{key}")]
 async fn get(
     path: web::Path<(String,)>,
-    service: web::Data<KeyValueService>,
+    service: web::Data<KeyValueService<FilesystemBlockIO>>,
 ) -> actix_web::Result<web::Json<Object>> {
     let (key,) = path.into_inner();
     match service.get(&key).await {
@@ -34,7 +35,7 @@ async fn get(
 #[post("/v1/put")]
 async fn put(
     objects: web::Json<Vec<Object>>,
-    service: web::Data<KeyValueService>,
+    service: web::Data<KeyValueService<FilesystemBlockIO>>,
 ) -> web::Json<PutResponse> {
     let result = match service.put(objects.into_inner()).await {
         Ok(_) => PutResponse::Success,
@@ -59,17 +60,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         max_block_size: 1024 * 1024,
     };
 
-    let block_io = FilesystemBlockIO::new(storage_path);
+    let storage = Storage::new(
+        Arc::new(FilesystemBlockIO::new(storage_path)),
+        storage_config,
+    )
+    .await?;
 
     // Read any existing objects from the storage
-    let existing_blocks = block_io.find_blocks().await?;
+    let existing_blocks = storage.block_io().find_blocks().await?;
     let existing_objects;
     if !existing_blocks.is_empty() {
         info!(
             "Found {} existing blocks, loading objects...",
             existing_blocks.len()
         );
-        existing_objects = Storage::read_blocks(&block_io, &existing_blocks).await?;
+        existing_objects = storage.read_blocks(&existing_blocks).await?;
         match existing_objects.len() {
             0 => info!("Found no existing objects"),
             count => info!("Found {count} existing objects"),
@@ -78,7 +83,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         info!("Found no existing blocks");
         existing_objects = HashMap::new();
     }
-    let storage = Storage::new(block_io, storage_config).await?;
     let engine = KeyValueEngine::from_existing(existing_objects);
     let service = web::Data::new(KeyValueService::new(engine, storage));
 
