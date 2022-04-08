@@ -4,7 +4,7 @@ use std::fmt;
 use std::io;
 use std::str::FromStr;
 use thiserror::Error;
-use tokio::io::{AsyncWrite, AsyncWriteExt, BufWriter};
+use tokio::io::{AsyncWrite, AsyncWriteExt};
 
 #[derive(PartialEq, Debug)]
 pub struct BlockPath {
@@ -61,7 +61,7 @@ impl Block {
 
 pub struct OpenBlock<W: AsyncWrite + Unpin + Send> {
     block: Block,
-    writer: BufWriter<W>,
+    writer: W,
     size: usize,
 }
 
@@ -69,13 +69,13 @@ impl<W: AsyncWrite + Unpin + Send> OpenBlock<W> {
     pub fn new(block: Block, writer: W, size: usize) -> Self {
         Self {
             block,
-            writer: BufWriter::new(writer),
+            writer,
             size,
         }
     }
 
     pub async fn write(&mut self, data: &[u8]) -> Result<usize, io::Error> {
-        self.writer.write(data).await?;
+        self.writer.write_all(data).await?;
         self.writer.flush().await?;
         self.size += data.len();
         Ok(self.size)
@@ -90,7 +90,7 @@ impl<W: AsyncWrite + Unpin + Send> OpenBlock<W> {
     }
 
     pub fn into_writer(self) -> W {
-        self.writer.into_inner()
+        self.writer
     }
 }
 
