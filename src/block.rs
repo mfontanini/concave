@@ -1,10 +1,8 @@
 use lazy_static::lazy_static;
 use regex::Regex;
 use std::fmt;
-use std::io;
 use std::str::FromStr;
 use thiserror::Error;
-use tokio::io::{AsyncWrite, AsyncWriteExt};
 
 #[derive(PartialEq, Debug)]
 pub struct BlockPath {
@@ -59,46 +57,9 @@ impl Block {
     }
 }
 
-pub struct OpenBlock<W: AsyncWrite + Unpin + Send> {
-    block: Block,
-    writer: W,
-    size: usize,
-}
-
-impl<W: AsyncWrite + Unpin + Send> OpenBlock<W> {
-    pub fn new(block: Block, writer: W, size: usize) -> Self {
-        Self {
-            block,
-            writer,
-            size,
-        }
-    }
-
-    pub async fn write(&mut self, data: &[u8]) -> Result<usize, io::Error> {
-        self.writer.write_all(data).await?;
-        self.writer.flush().await?;
-        self.size += data.len();
-        Ok(self.size)
-    }
-
-    pub fn block(&self) -> &Block {
-        &self.block
-    }
-
-    pub fn size(&self) -> usize {
-        self.size
-    }
-
-    pub fn into_writer(self) -> W {
-        self.writer
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::tempfile;
-    use tokio::fs::File;
 
     #[test]
     fn parse_block_path() {
@@ -125,17 +86,5 @@ mod tests {
             BlockPath::from_str("kv-18446744073709551616.block"),
             Err(BlockNameParseError::InvalidBlockIndex)
         );
-    }
-
-    #[tokio::test]
-    async fn open_block_write() {
-        let file = tempfile().unwrap();
-        let mut open_block = OpenBlock::new(Block { id: 0 }, File::from_std(file), 0);
-        assert_eq!(
-            open_block.write("hello world, ".as_bytes()).await.unwrap(),
-            13
-        );
-        assert_eq!(open_block.write("bye!".as_bytes()).await.unwrap(), 17);
-        assert_eq!(open_block.size(), 17);
     }
 }

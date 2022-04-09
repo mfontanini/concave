@@ -271,17 +271,18 @@ pub enum PutError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{io::NullBlockIO, storage::StorageConfig};
+    use crate::{io::MemoryBlockIO, storage::StorageConfig};
     use std::sync::Arc;
     use std::time::Duration;
 
-    async fn make_storage() -> Storage<NullBlockIO> {
+    async fn make_storage() -> Storage<MemoryBlockIO> {
         let config = StorageConfig {
             batch_time: Duration::from_millis(1),
             max_batch_size: 10,
             max_block_size: 10,
+            compaction_trigger_threshold: 5,
         };
-        Storage::new(Arc::new(NullBlockIO::default()), config)
+        Storage::new(Arc::new(MemoryBlockIO::default()), config)
             .await
             .unwrap()
     }

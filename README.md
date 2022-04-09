@@ -24,7 +24,7 @@ updates are made: puts either succeed and update all keys, or fail and their sta
 ## Durability
 
 A write ahead log is used to persist all changes. The log is split into several files, capped to some max capacity.
-These are periodically compacted by removing stale key versions (**note** compaction is not yet implemented).
+These are periodically compacted by removing stale key versions.
 
 Writes are asynchronously batched together and flushed to disk periodically. Put requests wait for the associated
 write to be flushed to disk before returning. This means a put request will not return until data is considered
