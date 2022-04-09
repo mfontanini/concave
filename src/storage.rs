@@ -65,8 +65,8 @@ impl WriteRequest {
 pub struct StorageConfig {
     pub batch_time: Duration,
     pub max_batch_size: usize,
-    pub max_block_size: usize,
-    pub compaction_trigger_threshold: usize,
+    pub max_block_size: u64,
+    pub max_blocks: usize,
 }
 
 /// This is the glue between writers and the underlying filesystem.
@@ -127,6 +127,11 @@ pub enum ReadError {
 pub enum WriteError {
     #[error("failed to schedule write")]
     ScheduleFailure,
+}
+
+struct CompactableBlocks {
+    blocks: [Block; 2],
+    removable_index: usize,
 }
 
 /// The state of the compaction task, if any
@@ -275,7 +280,7 @@ impl<B: BlockIO + Send + Sync + 'static> StorageWriter<B> {
         Self::launch_compaction(
             self.block_io.clone(),
             self.state.clone(),
-            self.config.compaction_trigger_threshold,
+            self.config.max_blocks,
         )
         .await;
         Ok(())
@@ -289,17 +294,32 @@ impl<B: BlockIO + Send + Sync + 'static> StorageWriter<B> {
         }
     }
 
-    fn compactable_blocks(state: &WriterSharedState, threshold: usize) -> Option<[Block; 2]> {
-        if state.closed_blocks.len() < threshold {
+    // Finds the "best" 2 blocks to be compacted. The goal here is to always compact the 2 consecutive blocks
+    // that have the smallest max combined size. This should eventually end up making the block size
+    // distribution fairly even`.
+    fn compactable_blocks(
+        state: &WriterSharedState,
+        max_blocks: usize,
+    ) -> Option<CompactableBlocks> {
+        if state.closed_blocks.len() <= max_blocks {
             None
         } else if matches!(state.compaction_state, CompactionState::Running) {
             warn!("Should trigger compaction but it's already in progress");
             None
         } else {
-            Some([
-                state.closed_blocks[0].clone(),
-                state.closed_blocks[1].clone(),
-            ])
+            // Window closed blocks in chunks of 2, sort by combined size and keep the smallest one
+            let mut candidates: Vec<_> = state.closed_blocks.windows(2).collect();
+            candidates.sort_by_key(|chunk| chunk[0].size + chunk[1].size);
+            let compactables = candidates[0];
+            let removable_index = state
+                .closed_blocks
+                .iter()
+                .position(|block| block.id == compactables[0].id)
+                .unwrap();
+            Some(CompactableBlocks {
+                blocks: [compactables[0].clone(), compactables[1].clone()],
+                removable_index,
+            })
         }
     }
 
@@ -311,7 +331,7 @@ impl<B: BlockIO + Send + Sync + 'static> StorageWriter<B> {
         spawn(async move {
             loop {
                 // Get the first 2 compactable blocks, if any
-                let blocks = {
+                let compactable_blocks = {
                     let mut state = state.lock().unwrap();
                     let blocks = match Self::compactable_blocks(&state, threshold) {
                         Some(blocks) => blocks,
@@ -321,14 +341,16 @@ impl<B: BlockIO + Send + Sync + 'static> StorageWriter<B> {
                     blocks
                 };
                 // Trigger compaction on these
-                if let Err(e) = Self::compact_blocks(&block_io, blocks).await {
+                if let Err(e) = Self::compact_blocks(&block_io, compactable_blocks.blocks).await {
                     error!("Error during compaction: {e}");
                     panic!("Error during compaction, cannot proceed");
                 }
                 // Drop the first one and reset our state
                 {
                     let mut state = state.lock().unwrap();
-                    state.closed_blocks.remove(0);
+                    state
+                        .closed_blocks
+                        .remove(compactable_blocks.removable_index);
                     state.compaction_state = CompactionState::Stopped;
                 }
             }
@@ -475,20 +497,20 @@ mod tests {
 
     fn make_config(
         max_batch_size: usize,
-        max_block_size: usize,
+        max_block_size: u64,
         batch_time: Duration,
     ) -> StorageConfig {
         StorageConfig {
             batch_time,
             max_batch_size,
             max_block_size,
-            compaction_trigger_threshold: 5,
+            max_blocks: 5,
         }
     }
 
     async fn make_storage(
         max_batch_size: usize,
-        max_block_size: usize,
+        max_block_size: u64,
         batch_time: Duration,
     ) -> Storage<MemoryBlockIO> {
         let block_io = Arc::new(MemoryBlockIO::default());
@@ -556,6 +578,50 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn compactable_blocks() {
+        type Writer = StorageWriter<MemoryBlockIO>;
+        let mut state = WriterSharedState {
+            closed_blocks: Vec::new(),
+            compaction_state: CompactionState::Running,
+        };
+        // Running -> no compaction
+        assert!(Writer::compactable_blocks(&state, 2).is_none());
+
+        // Fewer than 2 files -> no compaction
+        state.compaction_state = CompactionState::Stopped;
+        state.closed_blocks = vec![Block::new(0), Block::new(1)];
+        assert!(Writer::compactable_blocks(&state, 2).is_none());
+
+        // Expect the last 2 to be compacted
+        state.closed_blocks = vec![
+            Block::existing(0, 3),
+            Block::existing(1, 2),
+            Block::existing(2, 1),
+        ];
+        let blocks = Writer::compactable_blocks(&state, 2).unwrap();
+        assert_eq!(blocks.removable_index, 1);
+        assert_eq!(
+            blocks.blocks.as_slice(),
+            &[
+                state.closed_blocks[1].clone(),
+                state.closed_blocks[2].clone()
+            ]
+        );
+
+        // Now expect the first two
+        state.closed_blocks[2].size = 100;
+        let blocks = Writer::compactable_blocks(&state, 2).unwrap();
+        assert_eq!(blocks.removable_index, 0);
+        assert_eq!(
+            blocks.blocks.as_slice(),
+            &[
+                state.closed_blocks[0].clone(),
+                state.closed_blocks[1].clone()
+            ]
+        );
+    }
+
     #[tokio::test]
     async fn compaction() -> TestResult {
         let storage = make_instant_storage().await;
@@ -571,15 +637,15 @@ mod tests {
 
         // Ensure there's 3 blocks and compact the first two
         assert_eq!(storage.block_io().find_blocks().await?.len(), 3);
-        let blocks = [Block { id: 0 }, Block { id: 1 }];
+        let blocks = [Block::new(0), Block::new(1)];
         StorageWriter::compact_blocks(storage.block_io().as_ref(), blocks).await?;
 
         // We should no longer have the first one
         let blocks = storage.block_io().find_blocks().await?;
-        assert_eq!(blocks.as_slice(), [Block { id: 1 }, Block { id: 2 }]);
+        assert_eq!(blocks.as_slice(), [Block::new(1), Block::new(2)]);
 
         // We should have both of them set to version 1 (they start at version 0 here)
-        let objects = storage.read_blocks(&[Block { id: 1 }]).await?;
+        let objects = storage.read_blocks(&[Block::new(1)]).await?;
         assert_eq!(objects.len(), 2);
         assert_eq!(objects.get("a"), Some(&Object::versioned("a", "2", 1)));
         assert_eq!(objects.get("b"), Some(&Object::versioned("b", "2", 1)));
@@ -602,28 +668,27 @@ mod tests {
             storage.block_io()
         };
         let state = Arc::new(Mutex::new(WriterSharedState {
-            closed_blocks: vec![Block { id: 0 }, Block { id: 1 }, Block { id: 2 }],
+            closed_blocks: vec![Block::new(0), Block::new(1), Block::new(2)],
             compaction_state: CompactionState::Running,
         }));
         // Compaction state is running so nothing should happen
-        StorageWriter::launch_compaction(block_io.clone(), state.clone(), 2)
+        StorageWriter::launch_compaction(block_io.clone(), state.clone(), 1)
             .await
             .await?;
         assert_eq!(block_io.find_blocks().await?.len(), 3);
 
-        // Now set the state to stopped, and re-run. This should actually compact twice, as the threshold for
-        // compaction is set to 2
+        // Now set the state to stopped, and re-run. This should actually compact twice, as the max blocks is 1
         state.lock().unwrap().compaction_state = CompactionState::Stopped;
-        StorageWriter::launch_compaction(block_io.clone(), state.clone(), 2)
+        StorageWriter::launch_compaction(block_io.clone(), state.clone(), 1)
             .await
             .await?;
         let blocks = block_io.find_blocks().await?;
-        assert_eq!(blocks.as_slice(), &[Block { id: 2 }]);
+        assert_eq!(blocks.as_slice(), &[Block::new(2)]);
 
         // Ensure the state is now stopped and we only have one file
         let state = state.lock().unwrap();
         assert!(matches!(state.compaction_state, CompactionState::Stopped));
-        assert_eq!(state.closed_blocks.as_slice(), &[Block { id: 2 }]);
+        assert_eq!(state.closed_blocks.as_slice(), &[Block::new(2)]);
         Ok(())
     }
 }

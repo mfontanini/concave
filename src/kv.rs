@@ -280,7 +280,7 @@ mod tests {
             batch_time: Duration::from_millis(1),
             max_batch_size: 10,
             max_block_size: 10,
-            compaction_trigger_threshold: 5,
+            max_blocks: 5,
         };
         Storage::new(Arc::new(MemoryBlockIO::default()), config)
             .await

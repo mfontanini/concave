@@ -20,31 +20,26 @@ pub trait TemporaryBlock {
 pub struct OpenBlock<W: AsyncWrite + Unpin + Send> {
     block: Block,
     writer: W,
-    size: usize,
 }
 
 impl<W: AsyncWrite + Unpin + Send> OpenBlock<W> {
-    pub fn new(block: Block, writer: W, size: usize) -> Self {
-        Self {
-            block,
-            writer,
-            size,
-        }
+    pub fn new(block: Block, writer: W) -> Self {
+        Self { block, writer }
     }
 
-    pub async fn write(&mut self, data: &[u8]) -> Result<usize, io::Error> {
+    pub async fn write(&mut self, data: &[u8]) -> Result<(), io::Error> {
         self.writer.write_all(data).await?;
         self.writer.flush().await?;
-        self.size += data.len();
-        Ok(self.size)
+        self.block.size += data.len() as u64;
+        Ok(())
     }
 
     pub fn block(&self) -> &Block {
         &self.block
     }
 
-    pub fn size(&self) -> usize {
-        self.size
+    pub fn size(&self) -> u64 {
+        self.block.size
     }
 
     pub fn into_writer(self) -> W {
@@ -88,15 +83,16 @@ impl BlockIO for FilesystemBlockIO {
 
     async fn open_block(&self, id: u64) -> Result<OpenBlock<Self::Writer>, BlockOpenError> {
         let block_path = self.base_path.join(BlockPath { id }.to_string());
-        let block = Block { id };
+        let mut block = Block::new(id);
         let file = OpenOptions::new()
             .append(true)
             .create(true)
             .open(&block_path)
             .await?;
         let metadata = file.metadata().await?;
+        block.size = metadata.len();
 
-        Ok(OpenBlock::new(block, file, metadata.len() as usize))
+        Ok(OpenBlock::new(block, file))
     }
 
     async fn close_block(
@@ -118,11 +114,12 @@ impl BlockIO for FilesystemBlockIO {
         while let Some(entry) = dirs.next_entry().await? {
             if entry.file_type().await?.is_file() {
                 let file_name = entry.file_name();
+                let metadata = entry.metadata().await?;
                 let str_file_name = file_name
                     .to_str()
                     .ok_or(BlockNameParseError::InvalidBlockName)?;
                 let block_path: BlockPath = str_file_name.parse()?;
-                blocks.push(Block { id: block_path.id });
+                blocks.push(Block::existing(block_path.id, metadata.len()));
             }
         }
         blocks.sort_by(|left, right| left.id.cmp(&right.id));
@@ -219,8 +216,8 @@ impl BlockIO for MemoryBlockIO {
 
     async fn open_block(&self, id: u64) -> Result<OpenBlock<Self::Writer>, BlockOpenError> {
         let storage = io::Cursor::new(Vec::new());
-        let block = Block { id };
-        Ok(OpenBlock::new(block, storage, 0))
+        let block = Block::new(id);
+        Ok(OpenBlock::new(block, storage))
     }
 
     async fn close_block(
@@ -247,9 +244,7 @@ impl BlockIO for MemoryBlockIO {
         let blocks = self.blocks.lock().unwrap();
         let blocks = blocks
             .iter()
-            .map(|memory_block| Block {
-                id: memory_block.id,
-            })
+            .map(|memory_block| Block::new(memory_block.id))
             .collect();
         Ok(blocks)
     }
@@ -364,6 +359,7 @@ mod tests {
         let dir = tempdir()?;
         let block_io = FilesystemBlockIO::new(dir.path());
         let mut block = block_io.open_block(0).await?;
+        assert_eq!(block.size(), 0);
         block.write("hello world".as_bytes()).await?;
         block_io.close_block(block).await?;
 
@@ -388,6 +384,8 @@ mod tests {
         let mut buffer = String::new();
         reader.read_to_string(&mut buffer).await?;
         assert_eq!(buffer, "hello world");
+        assert_eq!(blocks[0].size, buffer.len() as u64);
+        assert_eq!(block_io.open_block(0).await?.size(), buffer.len() as u64);
         Ok(())
     }
 
@@ -399,7 +397,7 @@ mod tests {
 
         let block_io = FilesystemBlockIO::new(dir.path());
         let blocks = block_io.find_blocks().await?;
-        assert_eq!(blocks, &[Block { id: 0 }, Block { id: 1 }]);
+        assert_eq!(blocks, &[Block::new(0), Block::new(1)]);
         Ok(())
     }
 
@@ -411,9 +409,9 @@ mod tests {
     #[tokio::test]
     async fn open_block_write() -> TestResult {
         let file = tempfile()?;
-        let mut open_block = OpenBlock::new(Block { id: 0 }, File::from_std(file), 0);
-        assert_eq!(open_block.write("hello world, ".as_bytes()).await?, 13);
-        assert_eq!(open_block.write("bye!".as_bytes()).await?, 17);
+        let mut open_block = OpenBlock::new(Block::new(0), File::from_std(file));
+        open_block.write("hello world, ".as_bytes()).await?;
+        open_block.write("bye!".as_bytes()).await?;
         assert_eq!(open_block.size(), 17);
         Ok(())
     }

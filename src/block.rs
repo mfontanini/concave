@@ -49,9 +49,18 @@ pub enum BlockNameParseError {
 #[derive(PartialEq, Debug, Clone)]
 pub struct Block {
     pub id: u64,
+    pub size: u64,
 }
 
 impl Block {
+    pub fn new(id: u64) -> Self {
+        Self { id, size: 0 }
+    }
+
+    pub fn existing(id: u64, size: u64) -> Self {
+        Self { id, size }
+    }
+
     pub fn path(&self) -> BlockPath {
         BlockPath { id: self.id }
     }

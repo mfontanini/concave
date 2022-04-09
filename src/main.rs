@@ -58,7 +58,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         batch_time: Duration::from_millis(10),
         max_batch_size: 4096,
         max_block_size: 1024,
-        compaction_trigger_threshold: 2,
+        max_blocks: 5,
     };
 
     let storage = Storage::new(
