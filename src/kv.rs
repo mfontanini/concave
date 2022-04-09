@@ -1,7 +1,7 @@
 use crate::{
     io::BlockIO,
     storage::{self, Storage, WriteRequest},
-    Object,
+    Object, ObjectValue,
 };
 use std::collections::HashMap;
 use thiserror::Error;
@@ -9,13 +9,13 @@ use tokio::sync::oneshot;
 use tokio::sync::RwLock;
 
 struct VersionedValue {
-    value: String,
+    value: ObjectValue,
     version: u32,
     state: VersionedValueState,
 }
 
 impl VersionedValue {
-    fn new<S: Into<String>>(value: S) -> Self {
+    fn new<S: Into<ObjectValue>>(value: S) -> Self {
         Self {
             value: value.into(),
             version: 0,
@@ -70,11 +70,7 @@ impl KeyValueEngine {
         if entry.state == VersionedValueState::CreationInProgress {
             return None;
         }
-        Some(Object {
-            key: key.to_string(),
-            value: entry.value.clone(),
-            version: entry.version,
-        })
+        Some(Object::versioned(key, entry.value.clone(), entry.version))
     }
 
     pub async fn acquire<'a>(&self, keys: Vec<KeyVersion<'a>>) -> Result<(), AcquireError> {
@@ -153,10 +149,10 @@ pub struct KeyVersion<'a> {
 
 pub struct KeyValue {
     pub key: String,
-    pub value: String,
+    pub value: ObjectValue,
 }
 
-impl<K: Into<String>, V: Into<String>> From<(K, V)> for KeyValue {
+impl<K: Into<String>, V: Into<ObjectValue>> From<(K, V)> for KeyValue {
     fn from(key_value: (K, V)) -> Self {
         Self {
             key: key_value.0.into(),

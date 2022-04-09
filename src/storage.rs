@@ -1,7 +1,7 @@
 use crate::{
     block::Block,
     io::{BlockCloseError, BlockIO, BlockOpenError, FindBlocksError, OpenBlock, TemporaryBlock},
-    Object,
+    Object, ObjectValue,
 };
 use async_stream::try_stream;
 use futures::{Stream, StreamExt};
@@ -404,11 +404,7 @@ fn iter_objects<R: AsyncRead + Unpin>(reader: R) -> impl Stream<Item = Result<Ob
             // TODO: this +1 needs to be tweaked (will break for larger objects)
             reader.consume(object.encoded_len() + 1);
 
-            yield Object {
-                key: object.key,
-                value: object.value,
-                version: object.version,
-            };
+            yield Object::from(object);
         }
     }
 }
@@ -470,12 +466,83 @@ impl Drop for WriterContext {
     }
 }
 
+// Rust -> proto
 impl From<Object> for proto::Object {
     fn from(object: Object) -> proto::Object {
         proto::Object {
             key: object.key,
-            value: object.value,
+            value: Some(object.value.into()),
             version: object.version,
+        }
+    }
+}
+
+impl From<ObjectValue> for proto::ObjectValue {
+    fn from(value: ObjectValue) -> proto::ObjectValue {
+        use proto::object_value::SingleMulti;
+        use proto::single_value::Single;
+        match value {
+            ObjectValue::String(value) => proto::ObjectValue {
+                single_multi: Some(SingleMulti::Single(proto::SingleValue {
+                    single: Some(Single::String(value)),
+                })),
+            },
+            ObjectValue::Number(value) => proto::ObjectValue {
+                single_multi: Some(SingleMulti::Single(proto::SingleValue {
+                    single: Some(Single::Number(value)),
+                })),
+            },
+            ObjectValue::Bytes(value) => proto::ObjectValue {
+                single_multi: Some(SingleMulti::Single(proto::SingleValue {
+                    single: Some(Single::Bytes(value)),
+                })),
+            },
+            ObjectValue::Float(value) => proto::ObjectValue {
+                single_multi: Some(SingleMulti::Single(proto::SingleValue {
+                    single: Some(Single::Float(value)),
+                })),
+            },
+            ObjectValue::Bool(value) => proto::ObjectValue {
+                single_multi: Some(SingleMulti::Single(proto::SingleValue {
+                    single: Some(Single::Bool(value)),
+                })),
+            },
+        }
+    }
+}
+
+// Proto -> Rust
+
+// Note: these are actually fallible but given this is used internally it works for now
+
+impl From<proto::Object> for Object {
+    fn from(object: proto::Object) -> Object {
+        Object {
+            key: object.key,
+            value: object.value.unwrap().into(),
+            version: object.version,
+        }
+    }
+}
+
+impl From<proto::ObjectValue> for ObjectValue {
+    fn from(value: proto::ObjectValue) -> ObjectValue {
+        use proto::object_value::SingleMulti;
+        match value.single_multi.unwrap() {
+            SingleMulti::Single(single) => single.into(),
+        }
+    }
+}
+
+impl From<proto::SingleValue> for ObjectValue {
+    fn from(value: proto::SingleValue) -> ObjectValue {
+        use proto::single_value::Single;
+        match value.single.unwrap() {
+            Single::String(value) => ObjectValue::String(value),
+            Single::Number(value) => ObjectValue::Number(value),
+            Single::Bytes(value) => ObjectValue::Bytes(value),
+            Single::Float(value) => ObjectValue::Float(value),
+            Single::Bool(value) => ObjectValue::Bool(value),
         }
     }
 }
