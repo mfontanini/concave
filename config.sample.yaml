@@ -1,0 +1,20 @@
+# Configuration properties of the storage
+storage:
+  # Determines how long the writer task will wait to fill its buffer
+  batch_time: 10ms
+
+  # Determines the maximum batch size. Any batch that exceeds this size is immediately persisted,
+  # effectively ignoring `batch_time`
+  max_batch_size: 1096
+
+  # The maximum size for a block. Once a block goes past this size, it is closed and a new one is opened
+  max_block_size: 8192
+
+  # The maximum number of allowed blocks. Extra blocks will be compacted together.
+  max_blocks: 10
+
+# The path in which blocks will be stored
+blocks_path: /tmp/concave
+
+# The endpoint to which the HTTP server will be bound to
+bind_endpoint: 127.0.0.1:8080

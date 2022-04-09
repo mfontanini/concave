@@ -6,10 +6,9 @@ use concave::{
     Object,
 };
 use log::info;
-use serde_derive::Serialize;
+use serde_derive::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
 use tokio::fs::create_dir_all;
 
 #[derive(Serialize)]
@@ -45,24 +44,32 @@ async fn put(
     web::Json(result)
 }
 
+#[derive(Deserialize, Debug)]
+struct Config {
+    storage: StorageConfig,
+    blocks_path: String,
+    bind_endpoint: String,
+}
+
+fn load_config(path: &str) -> Result<Config, config::ConfigError> {
+    let builder = config::Config::builder()
+        .add_source(config::File::with_name(path))
+        .add_source(config::Environment::default().separator("_"));
+    builder.build()?.try_deserialize()
+}
+
 #[actix_web::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::Builder::new()
         .filter_level(log::LevelFilter::Info)
         .init();
     // TODO: config
-    let storage_path = "/tmp/concave";
-    create_dir_all(storage_path).await?;
-    let storage_config = StorageConfig {
-        batch_time: Duration::from_millis(10),
-        max_batch_size: 4096,
-        max_block_size: 1024,
-        max_blocks: 5,
-    };
+    let config = load_config("config.sample.yaml")?;
+    create_dir_all(&config.blocks_path).await?;
 
     let storage = Storage::new(
-        Arc::new(FilesystemBlockIO::new(storage_path)),
-        storage_config,
+        Arc::new(FilesystemBlockIO::new(config.blocks_path)),
+        config.storage,
     )
     .await?;
 
@@ -91,7 +98,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .app_data(service.clone())
             .service(web::scope("/v1").service(get).service(put))
     })
-    .bind(("127.0.0.1", 8080))?
+    .bind(config.bind_endpoint)?
     .run()
     .await?;
     Ok(())

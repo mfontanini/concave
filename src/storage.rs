@@ -7,6 +7,7 @@ use async_stream::try_stream;
 use futures::{Stream, StreamExt};
 use log::{error, info, warn};
 use prost::Message;
+use serde_derive::Deserialize;
 use std::collections::HashMap;
 use std::io;
 use std::sync::{
@@ -62,7 +63,9 @@ impl WriteRequest {
     }
 }
 
+#[derive(Deserialize, Debug)]
 pub struct StorageConfig {
+    #[serde(with = "humantime_serde")]
     pub batch_time: Duration,
     pub max_batch_size: usize,
     pub max_block_size: u64,
