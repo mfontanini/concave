@@ -19,8 +19,7 @@ enum PutResponse {
     Failure { error: String },
 }
 
-// TODO: move v1s to namespace in actix
-#[get("/v1/get/{key}")]
+#[get("/get/{key}")]
 async fn get(
     path: web::Path<(String,)>,
     service: web::Data<KeyValueService<FilesystemBlockIO>>,
@@ -32,7 +31,7 @@ async fn get(
     }
 }
 
-#[post("/v1/put")]
+#[post("/put")]
 async fn put(
     objects: web::Json<Vec<Object>>,
     service: web::Data<KeyValueService<FilesystemBlockIO>>,
@@ -90,8 +89,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     HttpServer::new(move || {
         App::new()
             .app_data(service.clone())
-            .service(get)
-            .service(put)
+            .service(web::scope("/v1").service(get).service(put))
     })
     .bind(("127.0.0.1", 8080))?
     .run()
