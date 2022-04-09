@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 use thiserror::Error;
 use tokio::time::timeout;
 use tokio::{
-    io::{AsyncBufReadExt, AsyncRead, BufReader},
+    io::{AsyncRead, AsyncReadExt},
     spawn,
     sync::{
         mpsc::{channel, Receiver, Sender},
@@ -276,7 +276,7 @@ impl<B: BlockIO + Send + Sync + 'static> StorageWriter<B> {
         open_block: OpenBlock<B::Writer>,
     ) -> Result<(), BlockCloseError> {
         let block = open_block.block().clone();
-        info!("Closing block {}", block.id);
+        info!("Closing block {}, size is {}", block.id, block.size);
         self.block_io.close_block(open_block).await?;
         self.state.lock().unwrap().closed_blocks.push(block);
         // Launch compaction if needed
@@ -394,18 +394,30 @@ async fn read_blocks<B: BlockIO>(
     Ok(objects)
 }
 
-fn iter_objects<R: AsyncRead + Unpin>(reader: R) -> impl Stream<Item = Result<Object, ReadError>> {
-    let mut reader = BufReader::new(reader);
-
+fn iter_objects<R: AsyncRead + Unpin>(
+    mut reader: R,
+) -> impl Stream<Item = Result<Object, ReadError>> {
     try_stream! {
+        let mut buffer = bytes::BytesMut::with_capacity(8192);
+        reader.read_buf(&mut buffer).await?;
+        let mut index = 0;
+        let mut eof = false;
+
         loop {
-            let buffer = reader.fill_buf().await?;
-            if buffer.is_empty() {
+            // TODO: this is gnarly and I'm tired
+            if buffer.len() - index < 2048 && !eof {
+                buffer = buffer.split_off(index);
+                let bytes_read = reader.read_buf(&mut buffer).await?;
+                eof = bytes_read == 0;
+                index = 0;
+            }
+            if buffer.len() - index == 0 && eof {
                 break;
             }
-            let object = proto::Object::decode_length_delimited(buffer)?;
-            // TODO: this +1 needs to be tweaked (will break for larger objects)
-            reader.consume(object.encoded_len() + 1);
+            let object = proto::Object::decode_length_delimited(&buffer[index..])?;
+            let lenght_field_size = prost::length_delimiter_len(object.encoded_len());
+            index += object.encoded_len() + lenght_field_size;
+            // reader.consume(object.encoded_len() + lenght_field_size);
 
             yield Object::from(object);
         }

@@ -101,5 +101,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     .bind(config.bind_endpoint)?
     .run()
     .await?;
+    info!("Server stopped, exiting");
     Ok(())
 }

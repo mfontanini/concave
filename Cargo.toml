@@ -7,6 +7,7 @@ edition = "2021"
 actix-web = "^4.0"
 async-stream = "^0.3"
 async-trait = "^0.1"
+bytes = "^1.1"
 config = { version = "^0.13", default-features = false, features = ["yaml"] }
 env_logger = "^0.9"
 humantime-serde = "^1.1"
@@ -17,12 +18,16 @@ prost = "^0.10"
 regex = "^1.5"
 serde_derive = "^1.0"
 serde = "^1.0"
+structopt = "^0.3"
 tempfile = "^3.3"
 thiserror = "^1.0"
 tokio = { version = "^1.17", features = ["rt-multi-thread", "fs", "macros", "io-util", "sync", "time"] }
 
 [dev-dependencies]
+anyhow = "^1.0"
 ctor = "^0.1"
+reqwest = { version = "^0.11", features = ["json"] }
+uuid = { version = "^0.8", features = ["v4"] }
 
 [build-dependencies]
 prost-build = "^0.10"
