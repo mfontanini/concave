@@ -1,12 +1,17 @@
 use crate::{
     io::BlockIO,
-    storage::{self, Storage, WriteRequest},
+    storage::{self, BatchWriteResult, Storage, WriteRequest, WriteResult},
     Object, ObjectValue,
 };
+use futures::future::join_all;
+use log::error;
 use std::collections::HashMap;
+use std::sync::Arc;
 use thiserror::Error;
-use tokio::sync::oneshot;
-use tokio::sync::RwLock;
+use tokio::{
+    spawn,
+    sync::{mpsc::Receiver, oneshot, RwLock},
+};
 
 struct VersionedValue {
     value: ObjectValue,
@@ -199,8 +204,14 @@ pub struct KeyValueService<B: BlockIO + Send + Sync + 'static> {
 /// This service interfaces directly with the key/value engine and the persistent storage
 /// and exposes a get/put API using their primitives.
 impl<B: BlockIO + Send + Sync + 'static> KeyValueService<B> {
-    pub fn new(engine: KeyValueEngine, storage: Storage<B>) -> Self {
-        Self { engine, storage }
+    pub fn new(engine: KeyValueEngine, mut storage: Storage<B>) -> Arc<Self> {
+        let batch_result_receiver = storage.take_batch_result_receiver().unwrap();
+        let this = Arc::new(Self { engine, storage });
+        spawn({
+            let this = this.clone();
+            this.process_batch_results(batch_result_receiver)
+        });
+        this
     }
 
     pub async fn get(&self, key: &str) -> Option<Object> {
@@ -209,10 +220,7 @@ impl<B: BlockIO + Send + Sync + 'static> KeyValueService<B> {
 
     pub async fn put(&self, objects: Vec<Object>) -> Result<(), PutError> {
         self.acquire(&objects).await?;
-        // TODO: get rid of clone by sending objects back from storage
-        // TODO: rollback on error
-        self.write(objects.clone()).await?;
-        self.commit(objects).await?;
+        self.write(objects).await?;
         Ok(())
     }
 
@@ -228,6 +236,41 @@ impl<B: BlockIO + Send + Sync + 'static> KeyValueService<B> {
         Ok(())
     }
 
+    async fn write(&self, objects: Vec<Object>) -> Result<(), PutError> {
+        let (sender, receiver) = oneshot::channel();
+        let request = WriteRequest::new(objects, sender);
+        self.storage.write(request).await?;
+        receiver.await?;
+        Ok(())
+    }
+
+    async fn process_batch_results(self: Arc<Self>, mut receiver: Receiver<BatchWriteResult>) {
+        while let Some(batch_result) = receiver.recv().await {
+            if let Err(e) = self.process_batch_result(batch_result).await {
+                error!("Error processing batch result: {e}");
+            }
+        }
+    }
+
+    async fn process_batch_result(&self, batch_result: BatchWriteResult) -> Result<(), PutError> {
+        match batch_result.result {
+            WriteResult::Success => self.commit(batch_result.objects).await?,
+            // TODO: rollback on error
+            WriteResult::Failure => error!("Rollbacks not implemented yet!"),
+        };
+        let mut notifiers_futs = Vec::new();
+        for notifier in batch_result.notifiers {
+            let result = batch_result.result.clone();
+            notifiers_futs.push(async move {
+                if let Err(e) = notifier.send(result) {
+                    error!("Error sending batch result: {e:?}");
+                }
+            });
+        }
+        join_all(notifiers_futs).await;
+        Ok(())
+    }
+
     async fn commit(&self, objects: Vec<Object>) -> Result<(), PutError> {
         let mut key_values = Vec::new();
         for object in objects {
@@ -237,14 +280,6 @@ impl<B: BlockIO + Send + Sync + 'static> KeyValueService<B> {
             });
         }
         self.engine.commit(key_values).await?;
-        Ok(())
-    }
-
-    async fn write(&self, objects: Vec<Object>) -> Result<(), PutError> {
-        let (sender, receiver) = oneshot::channel();
-        let request = WriteRequest::new(objects, sender);
-        self.storage.write(request).await?;
-        receiver.await?;
         Ok(())
     }
 }

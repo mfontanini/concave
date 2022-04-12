@@ -91,11 +91,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         existing_objects = HashMap::new();
     }
     let engine = KeyValueEngine::from_existing(existing_objects);
-    let service = web::Data::new(KeyValueService::new(engine, storage));
+    let service = KeyValueService::new(engine, storage);
 
     HttpServer::new(move || {
         App::new()
-            .app_data(service.clone())
+            .app_data(web::Data::from(service.clone()))
             .service(web::scope("/v1").service(get).service(put))
     })
     .bind(config.bind_endpoint)?

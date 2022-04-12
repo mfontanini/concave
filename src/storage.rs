@@ -5,7 +5,7 @@ use crate::{
 };
 use async_stream::try_stream;
 use futures::{Stream, StreamExt};
-use log::{error, info, warn};
+use log::{debug, error, info, warn};
 use prost::Message;
 use serde_derive::Deserialize;
 use std::collections::HashMap;
@@ -32,19 +32,27 @@ mod proto {
 }
 
 /// The result of a write operation
-#[derive(Debug, Clone)]
-pub struct WriteResult {
-    pub success: bool,
+#[derive(Debug)]
+pub struct BatchWriteResult {
+    pub result: WriteResult,
+    pub notifiers: Vec<oneshot::Sender<WriteResult>>,
+    pub objects: Vec<Object>,
 }
 
-impl WriteResult {
-    pub fn success() -> Self {
-        Self { success: true }
+impl BatchWriteResult {
+    fn new(result: WriteResult, batch: WriteBatch) -> Self {
+        Self {
+            result,
+            notifiers: batch.notifiers,
+            objects: batch.objects,
+        }
     }
+}
 
-    pub fn failure() -> Self {
-        Self { success: false }
-    }
+#[derive(Debug, Clone, PartialEq)]
+pub enum WriteResult {
+    Success,
+    Failure,
 }
 
 /// A request to write objects.
@@ -109,6 +117,10 @@ impl<B: BlockIO + Send + Sync + 'static> Storage<B> {
     pub fn block_io(&self) -> Arc<B> {
         self.block_io.clone()
     }
+
+    pub fn take_batch_result_receiver(&mut self) -> Option<Receiver<BatchWriteResult>> {
+        self.writer_context.batch_result_receiver.take()
+    }
 }
 
 #[derive(Debug, Error)]
@@ -154,6 +166,8 @@ struct StorageWriter<B: BlockIO> {
     state: Arc<Mutex<WriterSharedState>>,
     next_block_id: u64,
     config: StorageConfig,
+    write_result_sender: Sender<BatchWriteResult>,
+    write_result_receiver: Option<Receiver<BatchWriteResult>>,
 }
 
 impl<B: BlockIO + Send + Sync + 'static> StorageWriter<B> {
@@ -166,18 +180,22 @@ impl<B: BlockIO + Send + Sync + 'static> StorageWriter<B> {
             closed_blocks,
             compaction_state: CompactionState::Stopped,
         }));
+        let (write_result_sender, write_result_receiver) = channel(100);
         Ok(Self {
             block_io,
             state,
             next_block_id,
             config,
+            write_result_sender,
+            write_result_receiver: Some(write_result_receiver),
         })
     }
 
     /// Launches the writer. The sender in the returned context can be used to schedule write requests.
-    pub fn launch(self) -> WriterContext {
+    pub fn launch(mut self) -> WriterContext {
         let running = Arc::new(AtomicBool::new(true));
         let (request_sender, receiver) = channel(100);
+        let write_result_receiver = self.write_result_receiver.take().unwrap();
         spawn({
             let running = running.clone();
             async move {
@@ -187,7 +205,7 @@ impl<B: BlockIO + Send + Sync + 'static> StorageWriter<B> {
                 };
             }
         });
-        WriterContext::new(request_sender, running)
+        WriterContext::new(request_sender, running, write_result_receiver)
     }
 
     async fn write_loop(
@@ -199,7 +217,14 @@ impl<B: BlockIO + Send + Sync + 'static> StorageWriter<B> {
         while running.load(Ordering::Acquire) {
             let batch = self.build_batch(&mut receiver).await?;
             open_block = self.write_batch(open_block, &batch).await?;
-            Self::notify_all(batch.notifiers, WriteResult::success()).await;
+            if self
+                .write_result_sender
+                .send(BatchWriteResult::new(WriteResult::Success, batch))
+                .await
+                .is_err()
+            {
+                return Err(WriteLoopError::Disconnected);
+            }
         }
         Ok(())
     }
@@ -215,7 +240,11 @@ impl<B: BlockIO + Send + Sync + 'static> StorageWriter<B> {
             let request = match timeout(time_remaining, receiver.recv()).await {
                 Ok(Some(request)) => request,
                 Ok(None) => {
-                    Self::notify_all(batch.notifiers, WriteResult::failure()).await;
+                    // Ignore this as we're already in trouble
+                    let _ = self
+                        .write_result_sender
+                        .send(BatchWriteResult::new(WriteResult::Failure, batch))
+                        .await;
                     return Err(WriteLoopError::Disconnected);
                 }
                 Err(_) if batch.data.is_empty() => {
@@ -227,7 +256,7 @@ impl<B: BlockIO + Send + Sync + 'static> StorageWriter<B> {
             };
             batch = Self::add_to_batch(request, batch)?;
             if batch.data.len() >= self.config.max_batch_size {
-                info!("Batch reached max configured size, writing it");
+                debug!("Batch reached max configured size, writing it");
                 break;
             }
             time_remaining = match deadline.checked_duration_since(Instant::now()) {
@@ -246,7 +275,11 @@ impl<B: BlockIO + Send + Sync + 'static> StorageWriter<B> {
     }
 
     fn add_to_batch(request: WriteRequest, mut batch: WriteBatch) -> io::Result<WriteBatch> {
-        Self::serialize(request.objects.into_iter(), &mut batch.data)?;
+        for object in request.objects {
+            let proto_object = proto::Object::from(object);
+            proto_object.encode_length_delimited(&mut batch.data)?;
+            batch.objects.push(Object::from(proto_object));
+        }
         batch.notifiers.push(request.notifier);
         Ok(batch)
     }
@@ -287,14 +320,6 @@ impl<B: BlockIO + Send + Sync + 'static> StorageWriter<B> {
         )
         .await;
         Ok(())
-    }
-
-    async fn notify_all(notifiers: Vec<oneshot::Sender<WriteResult>>, result: WriteResult) {
-        for notifier in notifiers {
-            if let Err(e) = notifier.send(result.clone()) {
-                warn!("Could not send response to notifier: {e:?}");
-            }
-        }
     }
 
     // Finds the "best" 2 blocks to be compacted. The goal here is to always compact the 2 consecutive blocks
@@ -417,7 +442,6 @@ fn iter_objects<R: AsyncRead + Unpin>(
             let object = proto::Object::decode_length_delimited(&buffer[index..])?;
             let lenght_field_size = prost::length_delimiter_len(object.encoded_len());
             index += object.encoded_len() + lenght_field_size;
-            // reader.consume(object.encoded_len() + lenght_field_size);
 
             yield Object::from(object);
         }
@@ -455,18 +479,27 @@ struct WriteBatch {
 
     /// The senders to notify all of the pending writers
     notifiers: Vec<oneshot::Sender<WriteResult>>,
+
+    /// The objects being included in this batch
+    objects: Vec<Object>,
 }
 
 struct WriterContext {
     request_sender: Sender<WriteRequest>,
     running: Arc<AtomicBool>,
+    batch_result_receiver: Option<Receiver<BatchWriteResult>>,
 }
 
 impl WriterContext {
-    fn new(request_sender: Sender<WriteRequest>, running: Arc<AtomicBool>) -> Self {
+    fn new(
+        request_sender: Sender<WriteRequest>,
+        running: Arc<AtomicBool>,
+        batch_result_receiver: Receiver<BatchWriteResult>,
+    ) -> Self {
         Self {
             request_sender,
             running,
+            batch_result_receiver: Some(batch_result_receiver),
         }
     }
 
@@ -573,7 +606,7 @@ mod tests {
     fn init() {
         env_logger::Builder::new()
             .is_test(true)
-            .filter_level(log::LevelFilter::Info)
+            .filter_level(log::LevelFilter::Debug)
             .init();
     }
 
@@ -596,12 +629,23 @@ mod tests {
         batch_time: Duration,
     ) -> Storage<MemoryBlockIO> {
         let block_io = Arc::new(MemoryBlockIO::default());
-        Storage::new(
+        let mut storage = Storage::new(
             block_io,
             make_config(max_batch_size, max_block_size, batch_time),
         )
         .await
-        .unwrap()
+        .unwrap();
+
+        let mut result_receiver = storage.take_batch_result_receiver().unwrap();
+        spawn(async move {
+            while let Some(batch_result) = result_receiver.recv().await {
+                for notifier in batch_result.notifiers {
+                    notifier.send(batch_result.result.clone()).unwrap();
+                }
+            }
+        });
+
+        storage
     }
 
     async fn make_instant_storage() -> Storage<MemoryBlockIO> {
@@ -630,7 +674,7 @@ mod tests {
         let (notifier, receiver) = oneshot::channel();
         let batch = WriteRequest::new(batch_objects.clone(), notifier);
         storage.write(batch).await?;
-        assert!(receiver.await?.success);
+        assert_eq!(receiver.await?, WriteResult::Success);
 
         let blocks = storage.block_io().find_blocks().await?;
         assert_eq!(blocks.len(), 1);
@@ -649,7 +693,7 @@ mod tests {
             let (notifier, receiver) = oneshot::channel();
             let batch = WriteRequest::new(vec![Object::new(key, "and its value")], notifier);
             storage.write(batch).await?;
-            assert!(receiver.await?.success);
+            assert_eq!(receiver.await?, WriteResult::Success);
         }
 
         let blocks = storage.block_io().find_blocks().await?;
@@ -714,7 +758,7 @@ mod tests {
                 Object::versioned("b", *value, version as u32),
             ];
             storage.write(WriteRequest::new(objects, notifier)).await?;
-            assert!(receiver.await?.success);
+            assert_eq!(receiver.await?, WriteResult::Success);
         }
 
         // Ensure there's 3 blocks and compact the first two
@@ -745,7 +789,7 @@ mod tests {
                 storage
                     .write(WriteRequest::new(vec![objects], notifier))
                     .await?;
-                assert!(receiver.await?.success);
+                assert_eq!(receiver.await?, WriteResult::Success);
             }
             storage.block_io()
         };

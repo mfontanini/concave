@@ -1,11 +1,11 @@
 # Configuration properties of the storage
 storage:
   # Determines how long the writer task will wait to fill its buffer
-  batch_time: 2ms
+  batch_time: 5ms
 
   # Determines the maximum batch size. Any batch that exceeds this size is immediately persisted,
   # effectively ignoring `batch_time`
-  max_batch_size: 4096
+  max_batch_size: 8192
 
   # The maximum size for a block. Once a block goes past this size, it is closed and a new one is opened
   max_block_size: 4194304
