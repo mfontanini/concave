@@ -1,5 +1,5 @@
 use anyhow::Result;
-use concave::Object;
+use concave::{Object, ObjectValue};
 use reqwest::{Client, StatusCode};
 use serde_derive::Deserialize;
 use std::sync::Arc;
@@ -68,6 +68,14 @@ enum Command {
         batches: u32,
         batch_size: u32,
     },
+    BenchmarkGetNonExistent {
+        threads: u32,
+        iterations: u32,
+    },
+    BenchmarkIncrements {
+        threads: u32,
+        iterations: u32,
+    },
 }
 
 #[derive(StructOpt, Debug)]
@@ -112,10 +120,70 @@ async fn benchmark_puts(api: Api, tasks: u32, batches: u32, batch_size: u32) -> 
     let duration = start_time.elapsed();
     let total_insertions = tasks * batches * batch_size;
     let objects_per_second = total_insertions as f64 / (duration.as_millis() as f64 / 1000.0);
-    println!(
-        "Finished inserting {total_insertions} objects, total time {duration:?},
-objects per second: {objects_per_second:.2}"
-    );
+    println!("Inserted {total_insertions} objects in {duration:?}, objects per second: {objects_per_second:.2}");
+    Ok(())
+}
+
+async fn benchmark_get_non_existing(api: Api, tasks: u32, iterations: u32) -> Result<()> {
+    let api = Arc::new(api);
+    let mut handles = Vec::new();
+
+    let start_time = Instant::now();
+    for _ in 0..tasks {
+        let api = api.clone();
+        let task = async move {
+            for _ in 0..iterations {
+                let key = format!("{}", Uuid::new_v4());
+                if let Err(e) = api.get(&key).await {
+                    println!("Error getting key {key}: {e}");
+                }
+            }
+        };
+        handles.push(spawn(task));
+    }
+    for handle in handles {
+        handle.await?;
+    }
+    let duration = start_time.elapsed();
+    let total_keys = tasks * iterations;
+    let gets_per_second = total_keys as f64 / (duration.as_millis() as f64 / 1000.0);
+    println!("Fetched {total_keys} keys in {duration:?}, gets per second: {gets_per_second:.2}");
+    Ok(())
+}
+
+async fn benchmark_increments(api: Api, tasks: u32, iterations: u32) -> Result<()> {
+    let api = Arc::new(api);
+    let mut handles = Vec::new();
+
+    let start_time = Instant::now();
+    for _ in 0..tasks {
+        let api = api.clone();
+        let key = format!("{}", Uuid::new_v4());
+        let task = async move {
+            for _ in 0..iterations {
+                let next_object = match api.get(&key).await.unwrap() {
+                    Some(mut object) => {
+                        object.version += 1;
+                        match object.value {
+                            ObjectValue::Number(n) => object.value = ObjectValue::Number(n + 1),
+                            _ => panic!("Unexpected non-number value for key {key}!"),
+                        };
+                        object
+                    }
+                    None => Object::new(key.clone(), 0),
+                };
+                api.put(&[next_object]).await.unwrap();
+            }
+        };
+        handles.push(spawn(task));
+    }
+    for handle in handles {
+        handle.await?;
+    }
+    let duration = start_time.elapsed();
+    let total_keys = tasks * iterations;
+    let gets_per_second = total_keys as f64 / (duration.as_millis() as f64 / 1000.0);
+    println!("Incremented {total_keys} keys in {duration:?}, increments per second: {gets_per_second:.2}");
     Ok(())
 }
 
@@ -144,6 +212,14 @@ async fn main() -> Result<()> {
             batches,
             batch_size,
         } => benchmark_puts(api, threads, batches, batch_size).await?,
+        Command::BenchmarkGetNonExistent {
+            threads,
+            iterations,
+        } => benchmark_get_non_existing(api, threads, iterations).await?,
+        Command::BenchmarkIncrements {
+            threads,
+            iterations,
+        } => benchmark_increments(api, threads, iterations).await?,
     };
     Ok(())
 }
