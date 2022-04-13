@@ -86,6 +86,14 @@ Attempts to modify a set of key/value pairs.
 A few random benchmarks, all ran using the `cli` example app. These were ran on an Intel i7-9750H @ 2.6GHz,
 32 GB of RAM writing to an SSD. All benchmarks use UUID as keys and value unless otherwise specified.
 
+The configuration used when running the server are the once in the sample config file:
+* 5 ms batch time.
+* 8kb batch size.
+* 4MB block size.
+* 10 max blocks.
+
+The results are:
+
 * 512 parallel tasks each doing 1000 gets for non existent keys: 148k gets/s.
 * 512 parallel tasks inserting 500 batches of 1 object each: 70k insertions/s.
 * 512 parallel tasks inserting 5 batches of 500 objects each: 264k insertions/s.
