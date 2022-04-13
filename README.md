@@ -34,7 +34,7 @@ Log files are periodically compacted together, persisting only the latest versio
 
 An HTTP API is exposed that allows the 2 operations;
 
-### /v1/get/{key}
+### /v1/get?key=<key>
 
 Returns the state of the key or replies with 404 if it's not found.
 

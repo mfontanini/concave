@@ -11,6 +11,11 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::fs::create_dir_all;
 
+#[derive(Deserialize)]
+struct GetRequest {
+    key: String,
+}
+
 #[derive(Serialize)]
 #[serde(tag = "result")]
 enum PutResponse {
@@ -18,13 +23,12 @@ enum PutResponse {
     Failure { error: String },
 }
 
-#[get("/get/{key}")]
+#[get("/get")]
 async fn get(
-    path: web::Path<(String,)>,
+    query: web::Query<GetRequest>,
     service: web::Data<KeyValueService<FilesystemBlockIO>>,
 ) -> actix_web::Result<web::Json<Object>> {
-    let (key,) = path.into_inner();
-    match service.get(&key).await {
+    match service.get(&query.key).await {
         Some(object) => Ok(web::Json(object)),
         None => Err(actix_web::error::ErrorNotFound("nope")),
     }

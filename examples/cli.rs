@@ -31,7 +31,8 @@ impl Api {
     async fn get(&self, key: &str) -> Result<Option<Object>> {
         let result = self
             .client
-            .get(format!("{}/v1/get/{}", self.url, key))
+            .get(format!("{}/v1/get", self.url))
+            .query(&[("key", key)])
             .send()
             .await?;
         if result.status() == StatusCode::NOT_FOUND {
