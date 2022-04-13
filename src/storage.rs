@@ -146,7 +146,8 @@ pub enum WriteError {
 
 struct CompactableBlocks {
     blocks: [Block; 2],
-    removable_index: usize,
+    remove_index: usize,
+    merge_index: usize,
 }
 
 /// The state of the compaction task, if any
@@ -339,14 +340,17 @@ impl<B: BlockIO + Send + Sync + 'static> StorageWriter<B> {
             let mut candidates: Vec<_> = state.closed_blocks.windows(2).collect();
             candidates.sort_by_key(|chunk| chunk[0].size + chunk[1].size);
             let compactables = candidates[0];
-            let removable_index = state
+            // Find the index we'll remove. The next one is the one we'll merge into
+            let remove_index = state
                 .closed_blocks
                 .iter()
                 .position(|block| block.id == compactables[0].id)
                 .unwrap();
+            let merge_index = remove_index + 1;
             Some(CompactableBlocks {
                 blocks: [compactables[0].clone(), compactables[1].clone()],
-                removable_index,
+                remove_index,
+                merge_index,
             })
         }
     }
@@ -369,23 +373,26 @@ impl<B: BlockIO + Send + Sync + 'static> StorageWriter<B> {
                     blocks
                 };
                 // Trigger compaction on these
-                if let Err(e) = Self::compact_blocks(&block_io, compactable_blocks.blocks).await {
-                    error!("Error during compaction: {e}");
-                    panic!("Error during compaction, cannot proceed");
-                }
-                // Drop the first one and reset our state
+                let resulting_size =
+                    match Self::compact_blocks(&block_io, compactable_blocks.blocks).await {
+                        Ok(size) => size,
+                        Err(e) => {
+                            error!("Error during compaction: {e}");
+                            panic!("Error during compaction, cannot proceed");
+                        }
+                    };
+                // Drop the first one, update the second one's size, and reset our state
                 {
                     let mut state = state.lock().unwrap();
-                    state
-                        .closed_blocks
-                        .remove(compactable_blocks.removable_index);
+                    state.closed_blocks[compactable_blocks.merge_index].size = resulting_size;
+                    state.closed_blocks.remove(compactable_blocks.remove_index);
                     state.compaction_state = CompactionState::Stopped;
                 }
             }
         })
     }
 
-    async fn compact_blocks(block_io: &B, blocks: [Block; 2]) -> Result<(), CompactError> {
+    async fn compact_blocks(block_io: &B, blocks: [Block; 2]) -> Result<u64, CompactError> {
         info!("Compacting block {} into {}", blocks[0].id, blocks[1].id);
         let entries = read_blocks(block_io, &blocks).await?;
 
@@ -398,7 +405,7 @@ impl<B: BlockIO + Send + Sync + 'static> StorageWriter<B> {
         // Replace the newer one with the combined data and drop the older one
         block_io.replace_block(blocks[1].id, temporary).await?;
         block_io.drop_block(blocks[0].id).await?;
-        Ok(())
+        Ok(data.len() as u64)
     }
 }
 
@@ -726,7 +733,8 @@ mod tests {
             Block::existing(2, 1),
         ];
         let blocks = Writer::compactable_blocks(&state, 2).unwrap();
-        assert_eq!(blocks.removable_index, 1);
+        assert_eq!(blocks.remove_index, 1);
+        assert_eq!(blocks.merge_index, 2);
         assert_eq!(
             blocks.blocks.as_slice(),
             &[
@@ -738,7 +746,8 @@ mod tests {
         // Now expect the first two
         state.closed_blocks[2].size = 100;
         let blocks = Writer::compactable_blocks(&state, 2).unwrap();
-        assert_eq!(blocks.removable_index, 0);
+        assert_eq!(blocks.remove_index, 0);
+        assert_eq!(blocks.merge_index, 1);
         assert_eq!(
             blocks.blocks.as_slice(),
             &[
@@ -762,13 +771,17 @@ mod tests {
         }
 
         // Ensure there's 3 blocks and compact the first two
-        assert_eq!(storage.block_io().find_blocks().await?.len(), 3);
+        let storage_blocks = storage.block_io().find_blocks().await?;
+        assert_eq!(storage_blocks.len(), 3);
         let blocks = [Block::new(0), Block::new(1)];
         StorageWriter::compact_blocks(storage.block_io().as_ref(), blocks).await?;
 
         // We should no longer have the first one
         let blocks = storage.block_io().find_blocks().await?;
-        assert_eq!(blocks.as_slice(), [Block::new(1), Block::new(2)]);
+        assert_eq!(
+            blocks.as_slice(),
+            [storage_blocks[1].clone(), storage_blocks[2].clone()]
+        );
 
         // We should have both of them set to version 1 (they start at version 0 here)
         let objects = storage.read_blocks(&[Block::new(1)]).await?;
@@ -809,12 +822,19 @@ mod tests {
             .await
             .await?;
         let blocks = block_io.find_blocks().await?;
-        assert_eq!(blocks.as_slice(), &[Block::new(2)]);
+        let total_size = blocks.iter().map(|block| block.size).sum();
+        let expected_block = Block {
+            id: 2,
+            size: total_size,
+        };
+
+        assert_eq!(blocks.as_slice(), &[expected_block.clone()]);
 
         // Ensure the state is now stopped and we only have one file
         let state = state.lock().unwrap();
         assert!(matches!(state.compaction_state, CompactionState::Stopped));
-        assert_eq!(state.closed_blocks.as_slice(), &[Block::new(2)]);
+
+        assert_eq!(state.closed_blocks.as_slice(), &[expected_block]);
         Ok(())
     }
 }

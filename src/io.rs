@@ -244,7 +244,10 @@ impl BlockIO for MemoryBlockIO {
         let blocks = self.blocks.lock().unwrap();
         let blocks = blocks
             .iter()
-            .map(|memory_block| Block::new(memory_block.id))
+            .map(|memory_block| Block {
+                id: memory_block.id,
+                size: memory_block.data.len() as u64,
+            })
             .collect();
         Ok(blocks)
     }

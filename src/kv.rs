@@ -4,7 +4,7 @@ use crate::{
     Object, ObjectValue,
 };
 use futures::future::join_all;
-use log::error;
+use log::{debug, error};
 use std::collections::HashMap;
 use std::sync::Arc;
 use thiserror::Error;
@@ -129,7 +129,7 @@ impl KeyValueEngine {
                 } else {
                     cache
                         .entries
-                        .insert(key.to_string(), VersionedValue::new(""));
+                        .insert(key.to_string(), VersionedValue::new(0));
                     Ok(())
                 }
             }
@@ -262,8 +262,9 @@ impl<B: BlockIO + Send + Sync + 'static> KeyValueService<B> {
         for notifier in batch_result.notifiers {
             let result = batch_result.result.clone();
             notifiers_futs.push(async move {
-                if let Err(e) = notifier.send(result) {
-                    error!("Error sending batch result: {e:?}");
+                if notifier.send(result).is_err() {
+                    // This is fine: the client just disconnected. Their write succeeded but they won't know about it
+                    debug!("Error sending batch result, ignoring");
                 }
             });
         }

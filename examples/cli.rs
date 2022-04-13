@@ -64,7 +64,8 @@ enum Command {
     },
     BenchmarkPuts {
         threads: u32,
-        insertions: u32,
+        batches: u32,
+        batch_size: u32,
     },
 }
 
@@ -80,21 +81,26 @@ struct Options {
     command: Command,
 }
 
-async fn benchmark_puts(api: Api, tasks: u32, insertions: u32) -> Result<()> {
+async fn benchmark_puts(api: Api, tasks: u32, batches: u32, batch_size: u32) -> Result<()> {
     let api = Arc::new(api);
     let mut handles = Vec::new();
-    println!("Running {tasks} parallel tasks inserting {insertions} objects each...");
+
+    println!("Running {tasks} parallel tasks inserting {batches} batches of size {batch_size} objects each...");
     let start_time = Instant::now();
     for _ in 0..tasks {
         let api = api.clone();
         let task = async move {
-            for _ in 0..insertions {
-                let object = Object::versioned(
-                    format!("{}", Uuid::new_v4()),
-                    Uuid::new_v4().as_bytes().to_vec(),
-                    0,
-                );
-                api.put(&[object]).await.unwrap();
+            for _ in 0..batches {
+                let mut objects = Vec::new();
+                for _ in 0..batch_size {
+                    let object = Object::versioned(
+                        format!("{}", Uuid::new_v4()),
+                        Uuid::new_v4().as_bytes().to_vec(),
+                        0,
+                    );
+                    objects.push(object);
+                }
+                api.put(&objects).await.unwrap();
             }
         };
         handles.push(spawn(task));
@@ -103,8 +109,12 @@ async fn benchmark_puts(api: Api, tasks: u32, insertions: u32) -> Result<()> {
         handle.await?;
     }
     let duration = start_time.elapsed();
-    let puts_per_second = (insertions * tasks) as f64 / (duration.as_millis() as f64 / 1000.0);
-    println!("Total time {duration:?}, puts per second: {puts_per_second:.2}");
+    let total_insertions = tasks * batches * batch_size;
+    let objects_per_second = total_insertions as f64 / (duration.as_millis() as f64 / 1000.0);
+    println!(
+        "Finished inserting {total_insertions} objects, total time {duration:?},
+objects per second: {objects_per_second:.2}"
+    );
     Ok(())
 }
 
@@ -130,8 +140,9 @@ async fn main() -> Result<()> {
         }
         Command::BenchmarkPuts {
             threads,
-            insertions,
-        } => benchmark_puts(api, threads, insertions).await?,
+            batches,
+            batch_size,
+        } => benchmark_puts(api, threads, batches, batch_size).await?,
     };
     Ok(())
 }
