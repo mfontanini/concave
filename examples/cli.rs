@@ -2,8 +2,7 @@ use anyhow::Result;
 use concave::{Object, ObjectValue};
 use reqwest::{Client, StatusCode};
 use serde_derive::Deserialize;
-use std::sync::Arc;
-use std::time::Instant;
+use std::{sync::Arc, time::Instant};
 use structopt::StructOpt;
 use tokio::spawn;
 use uuid::Uuid;
@@ -22,60 +21,27 @@ struct Api {
 
 impl Api {
     fn new(url: String) -> Self {
-        Self {
-            client: Client::default(),
-            url,
-        }
+        Self { client: Client::default(), url }
     }
 
     async fn get(&self, key: &str) -> Result<Option<Object>> {
-        let result = self
-            .client
-            .get(format!("{}/v1/get", self.url))
-            .query(&[("key", key)])
-            .send()
-            .await?;
-        if result.status() == StatusCode::NOT_FOUND {
-            Ok(None)
-        } else {
-            Ok(result.json().await?)
-        }
+        let result = self.client.get(format!("{}/v1/get", self.url)).query(&[("key", key)]).send().await?;
+        if result.status() == StatusCode::NOT_FOUND { Ok(None) } else { Ok(result.json().await?) }
     }
 
     async fn put(&self, objects: &[Object]) -> Result<PutResponse> {
-        let result = self
-            .client
-            .post(format!("{}/v1/put", self.url))
-            .json(objects)
-            .send()
-            .await?;
+        let result = self.client.post(format!("{}/v1/put", self.url)).json(objects).send().await?;
         Ok(result.json().await?)
     }
 }
 
 #[derive(StructOpt, Debug)]
 enum Command {
-    Get {
-        key: String,
-    },
-    Put {
-        key: String,
-        value: String,
-        version: u32,
-    },
-    BenchmarkPuts {
-        threads: u32,
-        batches: u32,
-        batch_size: u32,
-    },
-    BenchmarkGetNonExistent {
-        threads: u32,
-        iterations: u32,
-    },
-    BenchmarkIncrements {
-        threads: u32,
-        iterations: u32,
-    },
+    Get { key: String },
+    Put { key: String, value: String, version: u32 },
+    BenchmarkPuts { threads: u32, batches: u32, batch_size: u32 },
+    BenchmarkGetNonExistent { threads: u32, iterations: u32 },
+    BenchmarkIncrements { threads: u32, iterations: u32 },
 }
 
 #[derive(StructOpt, Debug)]
@@ -102,11 +68,8 @@ async fn benchmark_puts(api: Api, tasks: u32, batches: u32, batch_size: u32) -> 
             for _ in 0..batches {
                 let mut objects = Vec::new();
                 for _ in 0..batch_size {
-                    let object = Object::versioned(
-                        format!("{}", Uuid::new_v4()),
-                        Uuid::new_v4().as_bytes().to_vec(),
-                        0,
-                    );
+                    let object =
+                        Object::versioned(format!("{}", Uuid::new_v4()), Uuid::new_v4().as_bytes().to_vec(), 0);
                     objects.push(object);
                 }
                 api.put(&objects).await.unwrap();
@@ -196,30 +159,20 @@ async fn main() -> Result<()> {
             Some(object) => println!("Value: {}, version: {}", object.value, object.version),
             None => println!("Key not found"),
         },
-        Command::Put {
-            key,
-            value,
-            version,
-        } => {
+        Command::Put { key, value, version } => {
             let object = Object::versioned(key, value, version);
             match api.put(&[object]).await? {
                 PutResponse::Success => println!("Success!"),
                 PutResponse::Failure { error } => println!("Put failed: {error}"),
             }
         }
-        Command::BenchmarkPuts {
-            threads,
-            batches,
-            batch_size,
-        } => benchmark_puts(api, threads, batches, batch_size).await?,
-        Command::BenchmarkGetNonExistent {
-            threads,
-            iterations,
-        } => benchmark_get_non_existing(api, threads, iterations).await?,
-        Command::BenchmarkIncrements {
-            threads,
-            iterations,
-        } => benchmark_increments(api, threads, iterations).await?,
+        Command::BenchmarkPuts { threads, batches, batch_size } => {
+            benchmark_puts(api, threads, batches, batch_size).await?
+        }
+        Command::BenchmarkGetNonExistent { threads, iterations } => {
+            benchmark_get_non_existing(api, threads, iterations).await?
+        }
+        Command::BenchmarkIncrements { threads, iterations } => benchmark_increments(api, threads, iterations).await?,
     };
     Ok(())
 }

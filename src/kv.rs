@@ -5,8 +5,7 @@ use crate::{
 };
 use futures::future::join_all;
 use log::{debug, error};
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 use thiserror::Error;
 use tokio::{
     spawn,
@@ -21,11 +20,7 @@ struct VersionedValue {
 
 impl VersionedValue {
     fn new<S: Into<ObjectValue>>(value: S) -> Self {
-        Self {
-            value: value.into(),
-            version: 0,
-            state: VersionedValueState::CreationInProgress,
-        }
+        Self { value: value.into(), version: 0, state: VersionedValueState::CreationInProgress }
     }
 }
 
@@ -52,20 +47,11 @@ impl KeyValueEngine {
         let entries = objects
             .into_iter()
             .map(|(key, object)| {
-                (
-                    key,
-                    VersionedValue {
-                        value: object.value,
-                        version: object.version,
-                        state: VersionedValueState::Idle,
-                    },
-                )
+                (key, VersionedValue { value: object.value, version: object.version, state: VersionedValueState::Idle })
             })
             .collect();
         let cache = KeyValueCache { entries };
-        Self {
-            cache: cache.into(),
-        }
+        Self { cache: cache.into() }
     }
 
     pub async fn get(&self, key: &str) -> Option<Object> {
@@ -106,11 +92,7 @@ impl KeyValueEngine {
         Ok(())
     }
 
-    fn acquire_key(
-        cache: &mut KeyValueCache,
-        key: &str,
-        expected_version: u32,
-    ) -> Result<(), AcquireError> {
+    fn acquire_key(cache: &mut KeyValueCache, key: &str, expected_version: u32) -> Result<(), AcquireError> {
         // TODO: make this better
         match cache.entries.get_mut(key) {
             Some(value) => {
@@ -127,9 +109,7 @@ impl KeyValueEngine {
                 if expected_version != 0 {
                     Err(AcquireError::IncorrectNewKeyVersion)
                 } else {
-                    cache
-                        .entries
-                        .insert(key.to_string(), VersionedValue::new(0));
+                    cache.entries.insert(key.to_string(), VersionedValue::new(0));
                     Ok(())
                 }
             }
@@ -159,10 +139,7 @@ pub struct KeyValue {
 
 impl<K: Into<String>, V: Into<ObjectValue>> From<(K, V)> for KeyValue {
     fn from(key_value: (K, V)) -> Self {
-        Self {
-            key: key_value.0.into(),
-            value: key_value.1.into(),
-        }
+        Self { key: key_value.0.into(), value: key_value.1.into() }
     }
 }
 
@@ -227,10 +204,7 @@ impl<B: BlockIO + Send + Sync + 'static> KeyValueService<B> {
     async fn acquire(&self, objects: &[Object]) -> Result<(), PutError> {
         let mut key_versions = Vec::new();
         for object in objects {
-            key_versions.push(KeyVersion {
-                key: &object.key,
-                version: object.version,
-            });
+            key_versions.push(KeyVersion { key: &object.key, version: object.version });
         }
         self.engine.acquire(key_versions).await?;
         Ok(())
@@ -275,10 +249,7 @@ impl<B: BlockIO + Send + Sync + 'static> KeyValueService<B> {
     async fn commit(&self, objects: Vec<Object>) -> Result<(), PutError> {
         let mut key_values = Vec::new();
         for object in objects {
-            key_values.push(KeyValue {
-                key: object.key,
-                value: object.value,
-            });
+            key_values.push(KeyValue { key: object.key, value: object.value });
         }
         self.engine.commit(key_values).await?;
         Ok(())
@@ -303,10 +274,8 @@ pub enum PutError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::codec::BincodeCodec;
-    use crate::{io::MemoryBlockIO, storage::StorageConfig};
-    use std::sync::Arc;
-    use std::time::Duration;
+    use crate::{codec::BincodeCodec, io::MemoryBlockIO, storage::StorageConfig};
+    use std::{sync::Arc, time::Duration};
 
     async fn make_storage() -> Storage<MemoryBlockIO> {
         let config = StorageConfig {
@@ -315,13 +284,7 @@ mod tests {
             max_block_size: 10,
             max_blocks: 5,
         };
-        Storage::new(
-            Arc::new(MemoryBlockIO::default()),
-            config,
-            BincodeCodec::default(),
-        )
-        .await
-        .unwrap()
+        Storage::new(Arc::new(MemoryBlockIO::default()), config, BincodeCodec::default()).await.unwrap()
     }
 
     #[tokio::test]
@@ -329,67 +292,35 @@ mod tests {
         let engine = KeyValueEngine::default();
         // Try to acquire using an incorrect initial version
         assert_eq!(
-            engine
-                .acquire(vec![KeyVersion::versioned("hello", 1)])
-                .await,
+            engine.acquire(vec![KeyVersion::versioned("hello", 1)]).await,
             Err(AcquireError::IncorrectNewKeyVersion),
         );
 
         // Acquire and commit
-        engine
-            .acquire(vec![KeyVersion::new("hello")])
-            .await
-            .unwrap();
-        engine
-            .commit(vec![("hello", "world").into()])
-            .await
-            .unwrap();
+        engine.acquire(vec![KeyVersion::new("hello")]).await.unwrap();
+        engine.commit(vec![("hello", "world").into()]).await.unwrap();
 
         // Make sure the write actually worked
-        assert_eq!(
-            engine.get("hello").await,
-            Some(Object::versioned("hello", "world", 1))
-        );
+        assert_eq!(engine.get("hello").await, Some(Object::versioned("hello", "world", 1)));
 
         // We should not be allowed to acquire for version 0
-        assert_eq!(
-            engine.acquire(vec![KeyVersion::new("hello")]).await,
-            Err(AcquireError::OutdatedVersion),
-        );
+        assert_eq!(engine.acquire(vec![KeyVersion::new("hello")]).await, Err(AcquireError::OutdatedVersion),);
 
         // We should be able to acquire again using version 1
-        assert_eq!(
-            engine
-                .acquire(vec![KeyVersion::versioned("hello", 1)])
-                .await,
-            Ok(())
-        );
+        assert_eq!(engine.acquire(vec![KeyVersion::versioned("hello", 1)]).await, Ok(()));
 
         // Write to it again and make sure it changed
-        assert_eq!(
-            engine.commit(vec![("hello", "world!").into()]).await,
-            Ok(())
-        );
-        assert_eq!(
-            engine.get("hello").await,
-            Some(Object::versioned("hello", "world!", 2))
-        );
+        assert_eq!(engine.commit(vec![("hello", "world!").into()]).await, Ok(()));
+        assert_eq!(engine.get("hello").await, Some(Object::versioned("hello", "world!", 2)));
     }
 
     #[tokio::test]
     async fn acquire_overlapping() {
         let engine = KeyValueEngine::default();
-        assert_eq!(
-            engine
-                .acquire(vec![KeyVersion::new("a"), KeyVersion::new("b")])
-                .await,
-            Ok(())
-        );
+        assert_eq!(engine.acquire(vec![KeyVersion::new("a"), KeyVersion::new("b")]).await, Ok(()));
         // b overlaps
         assert_eq!(
-            engine
-                .acquire(vec![KeyVersion::new("c"), KeyVersion::new("b")])
-                .await,
+            engine.acquire(vec![KeyVersion::new("c"), KeyVersion::new("b")]).await,
             Err(AcquireError::WriteInProgress),
         );
         // We should still be able to acquire c on its own (meaning rollback worked)
@@ -402,18 +333,9 @@ mod tests {
         // Not here yet
         assert_eq!(service.get("hello").await, None);
         // Wrong version
-        assert!(service
-            .put(vec![Object::versioned("hello", "world", 1)])
-            .await
-            .is_err());
+        assert!(service.put(vec![Object::versioned("hello", "world", 1)]).await.is_err());
         // Put and get it
-        service
-            .put(vec![Object::new("hello", "world")])
-            .await
-            .unwrap();
-        assert_eq!(
-            service.get("hello").await,
-            Some(Object::versioned("hello", "world", 1))
-        );
+        service.put(vec![Object::new("hello", "world")]).await.unwrap();
+        assert_eq!(service.get("hello").await, Some(Object::versioned("hello", "world", 1)));
     }
 }

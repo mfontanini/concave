@@ -1,14 +1,15 @@
 use crate::block::{Block, BlockNameParseError, BlockPath};
 use async_trait::async_trait;
-use std::io;
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::{
+    io,
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex},
+};
 use tempfile::{NamedTempFile, TempPath};
 use thiserror::Error;
-use tokio::io::AsyncWriteExt;
 use tokio::{
     fs::{self, File, OpenOptions},
-    io::{AsyncRead, AsyncWrite},
+    io::{AsyncRead, AsyncWrite, AsyncWriteExt},
 };
 
 #[async_trait]
@@ -54,8 +55,7 @@ pub trait BlockIO {
     type Temporary: TemporaryBlock + Unpin + Send;
 
     async fn open_block(&self, id: u64) -> Result<OpenBlock<Self::Writer>, BlockOpenError>;
-    async fn close_block(&self, open_block: OpenBlock<Self::Writer>)
-        -> Result<(), BlockCloseError>;
+    async fn close_block(&self, open_block: OpenBlock<Self::Writer>) -> Result<(), BlockCloseError>;
     async fn block_reader(&self, id: u64) -> io::Result<Box<dyn AsyncRead + Unpin + Send>>;
     async fn find_blocks(&self) -> Result<Vec<Block>, FindBlocksError>;
     async fn temporary_block(&self) -> io::Result<Self::Temporary>;
@@ -70,9 +70,7 @@ pub struct FilesystemBlockIO {
 
 impl FilesystemBlockIO {
     pub fn new<P: Into<PathBuf>>(base_path: P) -> Self {
-        Self {
-            base_path: base_path.into(),
-        }
+        Self { base_path: base_path.into() }
     }
 }
 
@@ -84,21 +82,14 @@ impl BlockIO for FilesystemBlockIO {
     async fn open_block(&self, id: u64) -> Result<OpenBlock<Self::Writer>, BlockOpenError> {
         let block_path = self.base_path.join(BlockPath { id }.to_string());
         let mut block = Block::new(id);
-        let file = OpenOptions::new()
-            .append(true)
-            .create(true)
-            .open(&block_path)
-            .await?;
+        let file = OpenOptions::new().append(true).create(true).open(&block_path).await?;
         let metadata = file.metadata().await?;
         block.size = metadata.len();
 
         Ok(OpenBlock::new(block, file))
     }
 
-    async fn close_block(
-        &self,
-        _open_block: OpenBlock<Self::Writer>,
-    ) -> Result<(), BlockCloseError> {
+    async fn close_block(&self, _open_block: OpenBlock<Self::Writer>) -> Result<(), BlockCloseError> {
         Ok(())
     }
 
@@ -115,9 +106,7 @@ impl BlockIO for FilesystemBlockIO {
             if entry.file_type().await?.is_file() {
                 let file_name = entry.file_name();
                 let metadata = entry.metadata().await?;
-                let str_file_name = file_name
-                    .to_str()
-                    .ok_or(BlockNameParseError::InvalidBlockName)?;
+                let str_file_name = file_name.to_str().ok_or(BlockNameParseError::InvalidBlockName)?;
                 let block_path: BlockPath = str_file_name.parse()?;
                 blocks.push(Block::existing(block_path.id, metadata.len()));
             }
@@ -203,9 +192,7 @@ impl MemoryBlockIO {
 
 impl Default for MemoryBlockIO {
     fn default() -> Self {
-        Self {
-            blocks: Arc::new(Mutex::new(Vec::new())),
-        }
+        Self { blocks: Arc::new(Mutex::new(Vec::new())) }
     }
 }
 
@@ -220,16 +207,10 @@ impl BlockIO for MemoryBlockIO {
         Ok(OpenBlock::new(block, storage))
     }
 
-    async fn close_block(
-        &self,
-        open_block: OpenBlock<Self::Writer>,
-    ) -> Result<(), BlockCloseError> {
+    async fn close_block(&self, open_block: OpenBlock<Self::Writer>) -> Result<(), BlockCloseError> {
         let id = open_block.block().id;
         let writer = open_block.into_writer();
-        let block = MemoryBlock {
-            id,
-            data: writer.into_inner(),
-        };
+        let block = MemoryBlock { id, data: writer.into_inner() };
         self.blocks.lock().unwrap().push(block);
         Ok(())
     }
@@ -244,10 +225,7 @@ impl BlockIO for MemoryBlockIO {
         let blocks = self.blocks.lock().unwrap();
         let blocks = blocks
             .iter()
-            .map(|memory_block| Block {
-                id: memory_block.id,
-                size: memory_block.data.len() as u64,
-            })
+            .map(|memory_block| Block { id: memory_block.id, size: memory_block.data.len() as u64 })
             .collect();
         Ok(blocks)
     }
@@ -311,8 +289,7 @@ pub enum BlockCloseError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::tempdir;
-    use tempfile::tempfile;
+    use tempfile::{tempdir, tempfile};
     use tokio::io::AsyncReadExt;
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 

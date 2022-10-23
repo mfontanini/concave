@@ -42,16 +42,8 @@ impl Object {
         Self::versioned(key, value, 0)
     }
 
-    pub fn versioned<K: Into<String>, V: Into<ObjectValue>>(
-        key: K,
-        value: V,
-        version: u32,
-    ) -> Self {
-        Self {
-            key: key.into(),
-            value: value.into(),
-            version,
-        }
+    pub fn versioned<K: Into<String>, V: Into<ObjectValue>>(key: K, value: V, version: u32) -> Self {
+        Self { key: key.into(), value: value.into(), version }
     }
 }
 

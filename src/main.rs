@@ -1,6 +1,6 @@
 use actix_web::{get, post, web, App, HttpServer};
-use concave::codec::BincodeCodec;
 use concave::{
+    codec::BincodeCodec,
     io::{BlockIO, FilesystemBlockIO},
     kv::{KeyValueEngine, KeyValueService},
     storage::{Storage, StorageConfig},
@@ -8,8 +8,7 @@ use concave::{
 };
 use log::info;
 use serde_derive::{Deserialize, Serialize};
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 use tokio::fs::create_dir_all;
 
 #[derive(Deserialize)]
@@ -42,9 +41,7 @@ async fn put(
 ) -> web::Json<PutResponse> {
     let result = match service.put(objects.into_inner()).await {
         Ok(_) => PutResponse::Success,
-        Err(e) => PutResponse::Failure {
-            error: e.to_string(),
-        },
+        Err(e) => PutResponse::Failure { error: e.to_string() },
     };
     web::Json(result)
 }
@@ -65,29 +62,20 @@ fn load_config(path: &str) -> Result<Config, config::ConfigError> {
 
 #[actix_web::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    env_logger::Builder::new()
-        .filter_level(log::LevelFilter::Info)
-        .init();
+    env_logger::Builder::new().filter_level(log::LevelFilter::Info).init();
     // TODO: config
     let config = load_config("config.sample.yaml")?;
     create_dir_all(&config.blocks_path).await?;
 
     let codec = BincodeCodec::default();
-    let storage = Storage::new(
-        Arc::new(FilesystemBlockIO::new(config.blocks_path)),
-        config.storage,
-        codec.clone(),
-    )
-    .await?;
+    let storage =
+        Storage::new(Arc::new(FilesystemBlockIO::new(config.blocks_path)), config.storage, codec.clone()).await?;
 
     // Read any existing objects from the storage
     let existing_blocks = storage.block_io().find_blocks().await?;
     let existing_objects;
     if !existing_blocks.is_empty() {
-        info!(
-            "Found {} existing blocks, loading objects...",
-            existing_blocks.len()
-        );
+        info!("Found {} existing blocks, loading objects...", existing_blocks.len());
         existing_objects = storage.read_blocks(&existing_blocks, &codec).await?;
         match existing_objects.len() {
             0 => info!("Found no existing objects"),
@@ -101,9 +89,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let service = KeyValueService::new(engine, storage);
 
     HttpServer::new(move || {
-        App::new()
-            .app_data(web::Data::from(service.clone()))
-            .service(web::scope("/v1").service(get).service(put))
+        App::new().app_data(web::Data::from(service.clone())).service(web::scope("/v1").service(get).service(put))
     })
     .bind(config.bind_endpoint)?
     .run()

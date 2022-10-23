@@ -1,8 +1,6 @@
-use bincode::DefaultOptions;
-use bincode::Options;
+use bincode::{DefaultOptions, Options};
 use serde::{de::DeserializeOwned, Serialize};
-use std::io::Read;
-use std::io::Write;
+use std::io::{Read, Write};
 use thiserror::Error;
 
 pub trait Codec: Clone {
@@ -74,9 +72,7 @@ mod test {
         let encoder = BincodeCodec::default();
         let mut buffer: Vec<u8> = vec![0; 100];
         let element: Vec<u32> = vec![1, 2, 3];
-        encoder
-            .encode(&element, &mut Cursor::new(&mut buffer))
-            .unwrap();
+        encoder.encode(&element, &mut Cursor::new(&mut buffer)).unwrap();
         let decoded_element: Vec<u32> = encoder.decode(&mut Cursor::new(&mut buffer)).unwrap();
         assert_eq!(decoded_element, element);
     }
