@@ -24,7 +24,7 @@ updates are made: writes either succeed and update all keys, or fail and their s
 
 Write requests are asynchronously batched together and flushed to disk periodically using a write ahead log. Put requests wait for the associated write to be flushed to disk before returning, which means requests will not return until data is considered to be persisted successfully on disk.
 
-All objects are serialized into protobuf models to reduce the size of the log.
+Bincode is used as the serialization format for objects in the log.
 
 ### Compaction
 

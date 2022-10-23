@@ -303,6 +303,7 @@ pub enum PutError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::codec::BincodeCodec;
     use crate::{io::MemoryBlockIO, storage::StorageConfig};
     use std::sync::Arc;
     use std::time::Duration;
@@ -314,9 +315,13 @@ mod tests {
             max_block_size: 10,
             max_blocks: 5,
         };
-        Storage::new(Arc::new(MemoryBlockIO::default()), config)
-            .await
-            .unwrap()
+        Storage::new(
+            Arc::new(MemoryBlockIO::default()),
+            config,
+            BincodeCodec::default(),
+        )
+        .await
+        .unwrap()
     }
 
     #[tokio::test]

@@ -1,15 +1,18 @@
+use crate::codec::Codec;
+use crate::codec::DecodeError;
+use crate::codec::EncodeError;
 use crate::{
     block::Block,
     io::{BlockCloseError, BlockIO, BlockOpenError, FindBlocksError, OpenBlock, TemporaryBlock},
-    Object, ObjectValue,
+    Object,
 };
 use async_stream::try_stream;
 use futures::{Stream, StreamExt};
 use log::{debug, error, info, warn};
-use prost::Message;
 use serde_derive::Deserialize;
 use std::collections::HashMap;
 use std::io;
+use std::io::Cursor;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc, Mutex,
@@ -26,10 +29,6 @@ use tokio::{
     },
     task::JoinHandle,
 };
-
-mod proto {
-    include!(concat!(env!("OUT_DIR"), "/storage.rs"));
-}
 
 /// The result of a write operation
 #[derive(Debug)]
@@ -87,8 +86,17 @@ pub struct Storage<B: BlockIO + Send + Sync + 'static> {
 }
 
 impl<B: BlockIO + Send + Sync + 'static> Storage<B> {
-    pub async fn new(block_io: Arc<B>, config: StorageConfig) -> Result<Self, StorageCreateError> {
-        let writer_context = StorageWriter::new(block_io.clone(), config).await?.launch();
+    pub async fn new<C>(
+        block_io: Arc<B>,
+        config: StorageConfig,
+        codec: C,
+    ) -> Result<Self, StorageCreateError>
+    where
+        C: Codec + Send + Sync + 'static,
+    {
+        let writer_context = StorageWriter::new(block_io.clone(), config, codec)
+            .await?
+            .launch();
         Ok(Self {
             block_io,
             writer_context,
@@ -107,11 +115,12 @@ impl<B: BlockIO + Send + Sync + 'static> Storage<B> {
 
     /// Reads all objects in a list of blocks. Blocks are assumed to be in order, meaning if key X
     /// shows up in block N and N+1, then its version in N+1 is assumed to be greater than the one in N.
-    pub async fn read_blocks(
+    pub async fn read_blocks<C: Codec>(
         &self,
         blocks: &[Block],
+        codec: &C,
     ) -> Result<HashMap<String, Object>, ReadError> {
-        read_blocks(self.block_io.as_ref(), blocks).await
+        read_blocks(self.block_io.as_ref(), blocks, codec).await
     }
 
     pub fn block_io(&self) -> Arc<B> {
@@ -134,8 +143,8 @@ pub enum ReadError {
     #[error(transparent)]
     Io(#[from] io::Error),
 
-    #[error("malformed stream")]
-    MalformedStream(#[from] prost::DecodeError),
+    #[error("malformed stream: {0}")]
+    MalformedStream(#[from] DecodeError),
 }
 
 #[derive(Debug, Error)]
@@ -162,17 +171,26 @@ struct WriterSharedState {
 }
 
 /// This is the type doing the heavy work: this batches data, manages BlockIOs, etc.
-struct StorageWriter<B: BlockIO> {
+struct StorageWriter<B, C> {
     block_io: Arc<B>,
     state: Arc<Mutex<WriterSharedState>>,
     next_block_id: u64,
+    codec: C,
     config: StorageConfig,
     write_result_sender: Sender<BatchWriteResult>,
     write_result_receiver: Option<Receiver<BatchWriteResult>>,
 }
 
-impl<B: BlockIO + Send + Sync + 'static> StorageWriter<B> {
-    pub async fn new(block_io: Arc<B>, config: StorageConfig) -> Result<Self, StorageCreateError> {
+impl<B, C> StorageWriter<B, C>
+where
+    B: BlockIO + Send + Sync + 'static,
+    C: Codec + Send + Sync + 'static,
+{
+    pub async fn new(
+        block_io: Arc<B>,
+        config: StorageConfig,
+        codec: C,
+    ) -> Result<Self, StorageCreateError> {
         let mut closed_blocks = block_io.find_blocks().await?;
         let next_block_id = closed_blocks.last().map(|block| block.id).unwrap_or(0);
         // The last block is not closed yet
@@ -187,6 +205,7 @@ impl<B: BlockIO + Send + Sync + 'static> StorageWriter<B> {
             state,
             next_block_id,
             config,
+            codec,
             write_result_sender,
             write_result_receiver: Some(write_result_receiver),
         })
@@ -255,7 +274,7 @@ impl<B: BlockIO + Send + Sync + 'static> StorageWriter<B> {
                 }
                 Err(_) => break,
             };
-            batch = Self::add_to_batch(request, batch)?;
+            batch = self.add_to_batch(request, batch)?;
             if batch.data.len() >= self.config.max_batch_size {
                 debug!("Batch reached max configured size, writing it");
                 break;
@@ -268,18 +287,23 @@ impl<B: BlockIO + Send + Sync + 'static> StorageWriter<B> {
         Ok(batch)
     }
 
-    fn serialize(objects: impl Iterator<Item = Object>, data: &mut Vec<u8>) -> io::Result<()> {
+    fn serialize(
+        objects: impl Iterator<Item = Object>,
+        data: &mut Vec<u8>,
+        codec: &C,
+    ) -> Result<(), EncodeError> {
+        let mut writer = Cursor::new(data);
         for object in objects {
-            proto::Object::from(object).encode_length_delimited(data)?;
+            codec.encode(&object, &mut writer)?;
         }
         Ok(())
     }
 
-    fn add_to_batch(request: WriteRequest, mut batch: WriteBatch) -> io::Result<WriteBatch> {
+    fn add_to_batch(&self, request: WriteRequest, mut batch: WriteBatch) -> io::Result<WriteBatch> {
         for object in request.objects {
-            let proto_object = proto::Object::from(object);
-            proto_object.encode_length_delimited(&mut batch.data)?;
-            batch.objects.push(Object::from(proto_object));
+            // TODO: unwrap
+            self.codec.encode(&object, &mut batch.data).unwrap();
+            batch.objects.push(object);
         }
         batch.notifiers.push(request.notifier);
         Ok(batch)
@@ -318,6 +342,7 @@ impl<B: BlockIO + Send + Sync + 'static> StorageWriter<B> {
             self.block_io.clone(),
             self.state.clone(),
             self.config.max_blocks,
+            self.codec.clone(),
         )
         .await;
         Ok(())
@@ -359,6 +384,7 @@ impl<B: BlockIO + Send + Sync + 'static> StorageWriter<B> {
         block_io: Arc<B>,
         state: Arc<Mutex<WriterSharedState>>,
         threshold: usize,
+        codec: C,
     ) -> JoinHandle<()> {
         spawn(async move {
             loop {
@@ -373,14 +399,19 @@ impl<B: BlockIO + Send + Sync + 'static> StorageWriter<B> {
                     blocks
                 };
                 // Trigger compaction on these
-                let resulting_size =
-                    match Self::compact_blocks(&block_io, compactable_blocks.blocks).await {
-                        Ok(size) => size,
-                        Err(e) => {
-                            error!("Error during compaction: {e}");
-                            panic!("Error during compaction, cannot proceed");
-                        }
-                    };
+                let resulting_size = match Self::compact_blocks(
+                    &block_io,
+                    compactable_blocks.blocks,
+                    &codec,
+                )
+                .await
+                {
+                    Ok(size) => size,
+                    Err(e) => {
+                        error!("Error during compaction: {e}");
+                        panic!("Error during compaction, cannot proceed");
+                    }
+                };
                 // Drop the first one, update the second one's size, and reset our state
                 {
                     let mut state = state.lock().unwrap();
@@ -392,14 +423,18 @@ impl<B: BlockIO + Send + Sync + 'static> StorageWriter<B> {
         })
     }
 
-    async fn compact_blocks(block_io: &B, blocks: [Block; 2]) -> Result<u64, CompactError> {
+    async fn compact_blocks(
+        block_io: &B,
+        blocks: [Block; 2],
+        codec: &C,
+    ) -> Result<u64, CompactError> {
         info!("Compacting block {} into {}", blocks[0].id, blocks[1].id);
-        let entries = read_blocks(block_io, &blocks).await?;
+        let entries = read_blocks(block_io, &blocks, codec).await?;
 
         // Create a temporary file and write all data to it
         let mut temporary = block_io.temporary_block().await?;
         let mut data = Vec::new();
-        Self::serialize(entries.into_values(), &mut data)?;
+        Self::serialize(entries.into_values(), &mut data, codec)?;
         temporary.write(&data).await?;
 
         // Replace the newer one with the combined data and drop the older one
@@ -409,15 +444,16 @@ impl<B: BlockIO + Send + Sync + 'static> StorageWriter<B> {
     }
 }
 
-async fn read_blocks<B: BlockIO>(
+async fn read_blocks<B: BlockIO, C: Codec>(
     block_io: &B,
     blocks: &[Block],
+    codec: &C,
 ) -> Result<HashMap<String, Object>, ReadError> {
     let mut objects = HashMap::new();
     for block in blocks {
         info!("Reading block {}", block.id);
         let reader = block_io.block_reader(block.id).await?;
-        let mut stream = Box::pin(iter_objects(reader));
+        let mut stream = Box::pin(iter_objects(reader, codec.clone()));
         while let Some(object) = stream.next().await {
             let object = object?;
             objects.insert(object.key.clone(), object);
@@ -426,9 +462,11 @@ async fn read_blocks<B: BlockIO>(
     Ok(objects)
 }
 
-fn iter_objects<R: AsyncRead + Unpin>(
-    mut reader: R,
-) -> impl Stream<Item = Result<Object, ReadError>> {
+fn iter_objects<R, C>(mut reader: R, codec: C) -> impl Stream<Item = Result<Object, ReadError>>
+where
+    R: AsyncRead + Unpin,
+    C: Codec,
+{
     try_stream! {
         let mut buffer = bytes::BytesMut::with_capacity(8192);
         reader.read_buf(&mut buffer).await?;
@@ -446,11 +484,11 @@ fn iter_objects<R: AsyncRead + Unpin>(
             if buffer.len() - index == 0 && eof {
                 break;
             }
-            let object = proto::Object::decode_length_delimited(&buffer[index..])?;
-            let lenght_field_size = prost::length_delimiter_len(object.encoded_len());
-            index += object.encoded_len() + lenght_field_size;
+            let mut cursor = Cursor::new(&buffer[index..]);
+            let object: Object = codec.decode(&mut cursor)?;
+            index += cursor.position() as usize;
 
-            yield Object::from(object);
+            yield object;
         }
     }
 }
@@ -477,6 +515,9 @@ enum CompactError {
 
     #[error(transparent)]
     Io(#[from] io::Error),
+
+    #[error("encoding failed: {0}")]
+    Encoding(#[from] EncodeError),
 }
 
 #[derive(Default)]
@@ -521,93 +562,14 @@ impl Drop for WriterContext {
     }
 }
 
-// Rust -> proto
-impl From<Object> for proto::Object {
-    fn from(object: Object) -> proto::Object {
-        proto::Object {
-            key: object.key,
-            value: Some(object.value.into()),
-            version: object.version,
-        }
-    }
-}
-
-impl From<ObjectValue> for proto::ObjectValue {
-    fn from(value: ObjectValue) -> proto::ObjectValue {
-        use proto::object_value::SingleMulti;
-        use proto::single_value::Single;
-        match value {
-            ObjectValue::String(value) => proto::ObjectValue {
-                single_multi: Some(SingleMulti::Single(proto::SingleValue {
-                    single: Some(Single::String(value)),
-                })),
-            },
-            ObjectValue::Number(value) => proto::ObjectValue {
-                single_multi: Some(SingleMulti::Single(proto::SingleValue {
-                    single: Some(Single::Number(value)),
-                })),
-            },
-            ObjectValue::Bytes(value) => proto::ObjectValue {
-                single_multi: Some(SingleMulti::Single(proto::SingleValue {
-                    single: Some(Single::Bytes(value)),
-                })),
-            },
-            ObjectValue::Float(value) => proto::ObjectValue {
-                single_multi: Some(SingleMulti::Single(proto::SingleValue {
-                    single: Some(Single::Float(value)),
-                })),
-            },
-            ObjectValue::Bool(value) => proto::ObjectValue {
-                single_multi: Some(SingleMulti::Single(proto::SingleValue {
-                    single: Some(Single::Bool(value)),
-                })),
-            },
-        }
-    }
-}
-
-// Proto -> Rust
-
-// Note: these are actually fallible but given this is used internally it works for now
-
-impl From<proto::Object> for Object {
-    fn from(object: proto::Object) -> Object {
-        Object {
-            key: object.key,
-            value: object.value.unwrap().into(),
-            version: object.version,
-        }
-    }
-}
-
-impl From<proto::ObjectValue> for ObjectValue {
-    fn from(value: proto::ObjectValue) -> ObjectValue {
-        use proto::object_value::SingleMulti;
-        match value.single_multi.unwrap() {
-            SingleMulti::Single(single) => single.into(),
-        }
-    }
-}
-
-impl From<proto::SingleValue> for ObjectValue {
-    fn from(value: proto::SingleValue) -> ObjectValue {
-        use proto::single_value::Single;
-        match value.single.unwrap() {
-            Single::String(value) => ObjectValue::String(value),
-            Single::Number(value) => ObjectValue::Number(value),
-            Single::Bytes(value) => ObjectValue::Bytes(value),
-            Single::Float(value) => ObjectValue::Float(value),
-            Single::Bool(value) => ObjectValue::Bool(value),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::codec::BincodeCodec;
     use crate::io::MemoryBlockIO;
     use std::sync::Arc;
     type TestResult = Result<(), Box<dyn std::error::Error>>;
+    type MemoryWriter = StorageWriter<MemoryBlockIO, BincodeCodec>;
 
     #[ctor::ctor]
     fn init() {
@@ -639,6 +601,7 @@ mod tests {
         let mut storage = Storage::new(
             block_io,
             make_config(max_batch_size, max_block_size, batch_time),
+            BincodeCodec::default(),
         )
         .await
         .unwrap();
@@ -686,7 +649,9 @@ mod tests {
         let blocks = storage.block_io().find_blocks().await?;
         assert_eq!(blocks.len(), 1);
 
-        let objects = storage.read_blocks(&blocks).await?;
+        let objects = storage
+            .read_blocks(&blocks, &BincodeCodec::default())
+            .await?;
         assert_eq!(objects.len(), 2);
         assert_eq!(objects.get("my key"), Some(&batch_objects[0]));
         assert_eq!(objects.get("another key"), Some(&batch_objects[1]));
@@ -706,25 +671,26 @@ mod tests {
         let blocks = storage.block_io().find_blocks().await?;
         assert_eq!(blocks.len(), 2);
 
-        let objects = storage.read_blocks(&blocks).await?;
+        let objects = storage
+            .read_blocks(&blocks, &BincodeCodec::default())
+            .await?;
         assert_eq!(objects.len(), 2);
         Ok(())
     }
 
     #[test]
     fn compactable_blocks() {
-        type Writer = StorageWriter<MemoryBlockIO>;
         let mut state = WriterSharedState {
             closed_blocks: Vec::new(),
             compaction_state: CompactionState::Running,
         };
         // Running -> no compaction
-        assert!(Writer::compactable_blocks(&state, 2).is_none());
+        assert!(MemoryWriter::compactable_blocks(&state, 2).is_none());
 
         // Fewer than 2 files -> no compaction
         state.compaction_state = CompactionState::Stopped;
         state.closed_blocks = vec![Block::new(0), Block::new(1)];
-        assert!(Writer::compactable_blocks(&state, 2).is_none());
+        assert!(MemoryWriter::compactable_blocks(&state, 2).is_none());
 
         // Expect the last 2 to be compacted
         state.closed_blocks = vec![
@@ -732,7 +698,7 @@ mod tests {
             Block::existing(1, 2),
             Block::existing(2, 1),
         ];
-        let blocks = Writer::compactable_blocks(&state, 2).unwrap();
+        let blocks = MemoryWriter::compactable_blocks(&state, 2).unwrap();
         assert_eq!(blocks.remove_index, 1);
         assert_eq!(blocks.merge_index, 2);
         assert_eq!(
@@ -745,7 +711,7 @@ mod tests {
 
         // Now expect the first two
         state.closed_blocks[2].size = 100;
-        let blocks = Writer::compactable_blocks(&state, 2).unwrap();
+        let blocks = MemoryWriter::compactable_blocks(&state, 2).unwrap();
         assert_eq!(blocks.remove_index, 0);
         assert_eq!(blocks.merge_index, 1);
         assert_eq!(
@@ -774,7 +740,12 @@ mod tests {
         let storage_blocks = storage.block_io().find_blocks().await?;
         assert_eq!(storage_blocks.len(), 3);
         let blocks = [Block::new(0), Block::new(1)];
-        StorageWriter::compact_blocks(storage.block_io().as_ref(), blocks).await?;
+        MemoryWriter::compact_blocks(
+            storage.block_io().as_ref(),
+            blocks,
+            &BincodeCodec::default(),
+        )
+        .await?;
 
         // We should no longer have the first one
         let blocks = storage.block_io().find_blocks().await?;
@@ -784,7 +755,9 @@ mod tests {
         );
 
         // We should have both of them set to version 1 (they start at version 0 here)
-        let objects = storage.read_blocks(&[Block::new(1)]).await?;
+        let objects = storage
+            .read_blocks(&[Block::new(1)], &BincodeCodec::default())
+            .await?;
         assert_eq!(objects.len(), 2);
         assert_eq!(objects.get("a"), Some(&Object::versioned("a", "2", 1)));
         assert_eq!(objects.get("b"), Some(&Object::versioned("b", "2", 1)));
@@ -810,15 +783,16 @@ mod tests {
             closed_blocks: vec![Block::new(0), Block::new(1), Block::new(2)],
             compaction_state: CompactionState::Running,
         }));
+        let codec = BincodeCodec::default();
         // Compaction state is running so nothing should happen
-        StorageWriter::launch_compaction(block_io.clone(), state.clone(), 1)
+        MemoryWriter::launch_compaction(block_io.clone(), state.clone(), 1, codec.clone())
             .await
             .await?;
         assert_eq!(block_io.find_blocks().await?.len(), 3);
 
         // Now set the state to stopped, and re-run. This should actually compact twice, as the max blocks is 1
         state.lock().unwrap().compaction_state = CompactionState::Stopped;
-        StorageWriter::launch_compaction(block_io.clone(), state.clone(), 1)
+        MemoryWriter::launch_compaction(block_io.clone(), state.clone(), 1, codec)
             .await
             .await?;
         let blocks = block_io.find_blocks().await?;

@@ -1,4 +1,5 @@
 use actix_web::{get, post, web, App, HttpServer};
+use concave::codec::BincodeCodec;
 use concave::{
     io::{BlockIO, FilesystemBlockIO},
     kv::{KeyValueEngine, KeyValueService},
@@ -71,9 +72,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = load_config("config.sample.yaml")?;
     create_dir_all(&config.blocks_path).await?;
 
+    let codec = BincodeCodec::default();
     let storage = Storage::new(
         Arc::new(FilesystemBlockIO::new(config.blocks_path)),
         config.storage,
+        codec.clone(),
     )
     .await?;
 
@@ -85,7 +88,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "Found {} existing blocks, loading objects...",
             existing_blocks.len()
         );
-        existing_objects = storage.read_blocks(&existing_blocks).await?;
+        existing_objects = storage.read_blocks(&existing_blocks, &codec).await?;
         match existing_objects.len() {
             0 => info!("Found no existing objects"),
             count => info!("Found {count} existing objects"),

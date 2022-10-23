@@ -2,6 +2,7 @@ use serde_derive::{Deserialize, Serialize};
 use std::fmt;
 
 pub mod block;
+pub mod codec;
 pub mod io;
 pub mod kv;
 pub mod storage;
@@ -14,7 +15,7 @@ pub struct Object {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
-#[serde(untagged)]
+// #[serde(untagged)]
 pub enum ObjectValue {
     String(String),
     Number(i64),
